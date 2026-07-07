@@ -7,14 +7,15 @@
     - Button 1: Move forward by TARGET_BLOCKS_CMD1 (4 blocks).
     - Button 2: Rotate Right, then move forward by TARGET_BLOCKS_CMD2 (2 blocks).
     - Button 3: Rotate Left, then move by TARGET_MARKERS_CMD3 (2 markers).
-    - Button ROTATE_R (arrow): Spin right until any black line is detected.
-    - Button ROTATE_L (arrow): Spin left until any black line is detected.
+    - Button ROTATE_R (arrow): Same as Button 5, mirrored (turns swapped left<->right).
+    - Button ROTATE_L (arrow): Same as Button 5.
     - Button 6: Spin 180 degrees, then move forward by TARGET_BLOCKS_CMD180.
     - Button 7: Strafe Left, counts junctions via SENSOR_LEFT only.
     - Button 8: Spin 180 degrees only (no forward move afterward).
     - Button 9: Strafe Right, counts junctions via SENSOR_RIGHT only.
     - Button 4: Sequence - forward 4, turn left, forward 2, turn right, forward 2, turn 180.
     - Button 5: Same as Button 4, then mirrored in reverse to return to the start location/heading.
+    - Button UP (arrow): Sequence - forward 5, turn 180, forward 5.
   ================================================================
 */
 
@@ -39,8 +40,9 @@ extern uint8_t speed_Lower_R;
 #define CMD_1           0x16 // Digit 1
 #define CMD_2           0x19 // Digit 2
 #define CMD_3           0x0D // Digit 3
-#define CMD_ROTATE_R    0x43 // Arrow button (PLAY/PAUSE) -> Spin right until line
-#define CMD_ROTATE_L    0x44 // Arrow button (PREV) -> Spin left until line
+#define CMD_ROTATE_R    0x43 // Arrow button (PLAY/PAUSE) -> Sequence 4 (Sequence 2 mirrored, left<->right swapped)
+#define CMD_ROTATE_L    0x44 // Arrow button (PREV) -> Sequence 2 (same as Button 5)
+#define CMD_UP          0x46 // Arrow button (UP) -> Sequence 3: forward 5, turn 180, forward 5
 #define CMD_180         0x5E // Digit 6 -> 180 degree turn, then move forward
 #define CMD_7           0x08 // Digit 7 -> Strafe Left
 #define CMD_180_ONLY    0x1C // Digit 8 -> 180 degree turn only (no forward move)
@@ -59,6 +61,7 @@ const int TARGET_BLOCKS_SEQ1_A = 4;  // Sequence leg 1: forward blocks before fi
 const int TARGET_BLOCKS_SEQ1_B = 2;  // Sequence leg 2: forward blocks after left turn
 const int TARGET_BLOCKS_SEQ1_C = 2;  // Sequence leg 3: forward blocks after right turn
 const int TARGET_BLOCKS_SEQ2_FINAL = 5;  // Button 5: forward blocks on the final return leg
+const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after the 180 turn
 
 // ── SPEED CONFIGURATIONS ──────────────────────────────────────
 #define SPEED_START_FAST       60    // Forward start speed for Button 1 (No turning)
@@ -219,33 +222,6 @@ bool rotate180() {
   return rotateRight90();
 }
 
-void rotateRightUntilLine() {
-  unsigned long t_start = millis();
-  while (millis() - t_start < TURN_BLIND_MS) {
-    if (checkEstop()) { restoreIR(); return; }
-    setMotorSpeed(SPEED_ROTATE); car.Turn_Right();          
-  }
-  while (true) {
-    if (checkEstop()) { restoreIR(); return; }
-    setMotorSpeed(SPEED_ROTATE); car.Turn_Right();
-    if (digitalRead(SENSOR_LEFT) == HIGH || digitalRead(SENSOR_MID) == HIGH || digitalRead(SENSOR_RIGHT) == HIGH) break;
-  }
-  restoreIR(); 
-}
-
-void rotateLeftUntilLine() {
-  unsigned long t_start = millis();
-  while (millis() - t_start < TURN_BLIND_MS) {
-    if (checkEstop()) { restoreIR(); return; }
-    setMotorSpeed(SPEED_ROTATE); car.Turn_Left();          
-  }
-  while (true) {
-    if (checkEstop()) { restoreIR(); return; }
-    setMotorSpeed(SPEED_ROTATE); car.Turn_Left();
-    if (digitalRead(SENSOR_LEFT) == HIGH || digitalRead(SENSOR_MID) == HIGH || digitalRead(SENSOR_RIGHT) == HIGH) break;
-  }
-  restoreIR(); 
-}
 
 // ================================================================
 //  LINE TRACKING FORWARD MOVEMENTS
@@ -486,6 +462,44 @@ void runSequence2() {
   moveForwardBlocks(TARGET_BLOCKS_SEQ2_FINAL, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
 }
 
+// Button UP: forward 5, turn 180, forward 5.
+// Aborts early (leaving the car stopped) if the turn is interrupted by E-STOP.
+void runSequence3() {
+  moveForwardBlocks(TARGET_BLOCKS_SEQ3, SPEED_START_FAST, OFFSET_CMD1_MS);
+  delay(1000);
+  if (!rotate180()) return;
+  delay(1000);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ3, SPEED_POST_180_TURN, OFFSET_POST_180_MS);
+}
+
+// Button ROTATE_R (arrow): same path as Sequence 2 (Button 5), but mirrored --
+// every left turn becomes a right turn and vice versa.
+// Aborts early (leaving the car stopped) if a turn is interrupted by E-STOP.
+void runSequence4() {
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_A, SPEED_START_FAST, OFFSET_CMD1_MS);
+  delay(1000);
+  if (!rotateRight90()) return;
+  delay(1000);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_B, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
+  delay(1000);
+  if (!rotateLeft90()) return;
+  delay(1000);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
+  delay(1000);
+  if (!rotate180()) return;
+  delay(1000);
+  // Reverse leg: retrace forward 2 -> right -> forward 2 -> left -> forward 5, back to start.
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_180_TURN, OFFSET_POST_180_MS);
+  delay(1000);
+  if (!rotateRight90()) return;
+  delay(1000);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_B, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
+  delay(1000);
+  if (!rotateLeft90()) return;
+  delay(1000);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ2_FINAL, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
+}
+
 // ================================================================
 //  SETUP & LOOP
 // ================================================================
@@ -526,10 +540,10 @@ void loop() {
     } 
   } 
   else if (cmd == CMD_ROTATE_R) {
-    rotateRightUntilLine();
-  } 
+    runSequence4();
+  }
   else if (cmd == CMD_ROTATE_L) {
-    rotateLeftUntilLine();
+    runSequence2();
   }
   else if (cmd == CMD_180) {
     if (rotate180()) {
@@ -554,6 +568,9 @@ void loop() {
   }
   else if (cmd == CMD_SEQ2) {
     runSequence2();
+  }
+  else if (cmd == CMD_UP) {
+    runSequence3();
   }
 
   IrReceiver.resume();
