@@ -22,12 +22,21 @@
 #include <Arduino.h>
 #include <MecanumCar_v2.h>
 #include <IRremote.hpp>
+#include <SoftwareSerial.h>
 
 // ── Hardware pins ─────────────────────────────────────────────
 #define RECV_PIN        A3
 #define SENSOR_LEFT     A0
 #define SENSOR_MID      A1
 #define SENSOR_RIGHT    A2
+
+// Dedicated link to the ESP32 WiFi bridge (see esp32-wifi-bridge/), kept
+// separate from the USB debug Serial so telemetry doesn't get mixed in with
+// (or blocked by) debug prints. Same wiring convention as lib/main.cpp:
+// Uno pin 11 (RX) <- ESP32 pin 17 (TX2), Uno pin 10 (TX) -> ESP32 pin 16 (RX2).
+#define ESP_RX_PIN      11
+#define ESP_TX_PIN      10
+SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
 
 // ── EXTERN LIBRARY VARIABLES ──────────────────────────────────
 extern uint8_t speed_Upper_L;
@@ -149,6 +158,60 @@ bool checkEstop() {
 }
 
 // ================================================================
+//  FAVORIOT TELEMETRY (via ESP32 WiFi bridge)
+// ================================================================
+// Name of the IR command currently executing, used to label telemetry
+// emitted from inside the movement functions below (which don't otherwise
+// know which top-level command triggered them).
+const char* currentCommandName = "IDLE";
+
+const char* cmdName(uint8_t cmd) {
+  switch (cmd) {
+    case CMD_STAR:     return "CMD_STAR";
+    case CMD_1:        return "CMD_1";
+    case CMD_2:        return "CMD_2";
+    case CMD_3:        return "CMD_3";
+    case CMD_ROTATE_R: return "CMD_ROTATE_R";
+    case CMD_ROTATE_L: return "CMD_ROTATE_L";
+    case CMD_UP:       return "CMD_UP";
+    case CMD_180:      return "CMD_180";
+    case CMD_7:        return "CMD_7";
+    case CMD_180_ONLY: return "CMD_180_ONLY";
+    case CMD_9:        return "CMD_9";
+    case CMD_SEQ1:     return "CMD_SEQ1";
+    case CMD_SEQ2:     return "CMD_SEQ2";
+    default:           return "UNKNOWN";
+  }
+}
+
+// Sends one JSON telemetry line to the ESP32 bridge, which wraps it as the
+// "data" object of a Favoriot stream POST. Called only on state changes
+// (command start/finish, block progress, e-stop) rather than continuously,
+// since SoftwareSerial briefly disables interrupts while transmitting and
+// frequent calls could interfere with IR decode timing.
+void sendTelemetry(const char* status, int blockCount) {
+  espSerial.print(F("{\"command\":\""));
+  espSerial.print(currentCommandName);
+  espSerial.print(F("\",\"status\":\""));
+  espSerial.print(status);
+  espSerial.print(F("\",\"sensor_left\":"));
+  espSerial.print(digitalRead(SENSOR_LEFT));
+  espSerial.print(F(",\"sensor_mid\":"));
+  espSerial.print(digitalRead(SENSOR_MID));
+  espSerial.print(F(",\"sensor_right\":"));
+  espSerial.print(digitalRead(SENSOR_RIGHT));
+  espSerial.print(F(",\"block_count\":"));
+  espSerial.print(blockCount);
+  espSerial.println(F("}"));
+}
+
+void reportEstop() {
+  Serial.println(F("E-STOP!"));
+  restoreIR();
+  sendTelemetry("estop", -1);
+}
+
+// ================================================================
 //  ROTATION FUNCTIONS
 // ================================================================
 // After the edge sensor first sees the target line, creep slowly and wait
@@ -162,7 +225,7 @@ bool centerOnLine(bool turnRight) {
 
   while (true) {
     if (checkEstop()) {
-      Serial.println(F("E-STOP!")); restoreIR(); return false;
+      reportEstop(); return false;
     }
 
     setMotorSpeed(TURN_CREEP_SPEED);
@@ -189,7 +252,7 @@ bool rotateRight90() {
   // so the blind period + detection below finds the NEXT line, not the current one.
   while (digitalRead(STOP_SENSOR_RIGHT_TURN) == HIGH) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false;
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE);
     car.Turn_Right();
@@ -197,14 +260,14 @@ bool rotateRight90() {
   unsigned long t_start = millis();
   while (millis() - t_start < TURN_BLIND_MS) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false; 
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE); 
     car.Turn_Right();          
   }
   while (true) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false; 
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE);
     car.Turn_Right();
@@ -224,7 +287,7 @@ bool rotateLeft90() {
   // so the blind period + detection below finds the NEXT line, not the current one.
   while (digitalRead(STOP_SENSOR_LEFT_TURN) == HIGH) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false;
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE);
     car.Turn_Left();
@@ -232,14 +295,14 @@ bool rotateLeft90() {
   unsigned long t_start = millis();
   while (millis() - t_start < TURN_BLIND_MS) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false; 
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE); 
     car.Turn_Left();
   }
   while (true) {
     if (checkEstop()) {
-       Serial.println(F("E-STOP!")); restoreIR(); return false; 
+       reportEstop(); return false;
     }
     setMotorSpeed(SPEED_ROTATE);
     car.Turn_Left();
@@ -279,22 +342,23 @@ void moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
     if (L == HIGH && M == HIGH && R == HIGH) {
       if (!onJunction) {
         junctionCount++;
-        onJunction = true; 
-        if (junctionCount == targetBlocks) break; 
+        onJunction = true;
+        sendTelemetry("running", junctionCount);
+        if (junctionCount == targetBlocks) break;
       }
-      setMotorSpeed(currentSpeed); car.Advance();                  
-    } 
+      setMotorSpeed(currentSpeed); car.Advance();
+    }
     else if (L == LOW && M == HIGH && R == LOW) {
-      onJunction = false; setMotorSpeed(currentSpeed); car.Advance();                  
+      onJunction = false; setMotorSpeed(currentSpeed); car.Advance();
     }
     else if (L == LOW && M == LOW && R == HIGH) {
-      onJunction = false; setMotorSpeed(currentSpeed + 10); car.Turn_Right();               
+      onJunction = false; setMotorSpeed(currentSpeed + 10); car.Turn_Right();
     }
     else if (L == HIGH && M == LOW && R == LOW) {
-      onJunction = false; setMotorSpeed(currentSpeed + 10); car.Turn_Left();                
+      onJunction = false; setMotorSpeed(currentSpeed + 10); car.Turn_Left();
     }
     else if (L == LOW && M == LOW && R == LOW) {
-      onJunction = false; setMotorSpeed(currentSpeed); car.Advance();                  
+      onJunction = false; setMotorSpeed(currentSpeed); car.Advance();
     }
     else if (L == HIGH && M == HIGH && R == LOW) {
       onJunction = false; setMotorSpeed(currentSpeed + 10); car.Turn_Left();
@@ -304,15 +368,15 @@ void moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
     }
 
     if (IrReceiver.decode()) {
-      if (IrReceiver.decodedIRData.command == CMD_STAR) break; 
+      if (IrReceiver.decodedIRData.command == CMD_STAR) break;
       IrReceiver.resume();
     }
   }
 
   if (junctionCount == targetBlocks && endOffsetMs > 0) {
-    setMotorSpeed(SPEED_MIN); car.Advance(); delay(endOffsetMs); 
+    setMotorSpeed(SPEED_MIN); car.Advance(); delay(endOffsetMs);
   }
-  restoreIR(); 
+  restoreIR();
 }
 
 void moveRightSideMarkers(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
@@ -331,8 +395,9 @@ void moveRightSideMarkers(int targetBlocks, uint8_t startSpeed, int endOffsetMs)
     if (M == HIGH && R == HIGH) {
       if (!onMarker) {
         markerCount++;
-        onMarker = true; 
-        if (markerCount == targetBlocks) break; 
+        onMarker = true;
+        sendTelemetry("running", markerCount);
+        if (markerCount == targetBlocks) break;
       }
       setMotorSpeed(currentSpeed); car.Advance();                  
     } 
@@ -385,6 +450,7 @@ void strafeLeftBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
         junctionCount++;
         Serial.print(F("Left Sensor Hit! Total: ")); Serial.println(junctionCount);
         onJunction = true;
+        sendTelemetry("running", junctionCount);
         if (junctionCount == targetBlocks) break;
       }
     } else {
@@ -429,6 +495,7 @@ void strafeRightBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
         junctionCount++;
         Serial.print(F("Right Sensor Hit! Total: ")); Serial.println(junctionCount);
         onJunction = true;
+        sendTelemetry("running", junctionCount);
         if (junctionCount == targetBlocks) break;
       }
     } else {
@@ -542,6 +609,7 @@ void runSequence4() {
 // ================================================================
 void setup() {
   Serial.begin(9600);
+  espSerial.begin(9600);
   pinMode(SENSOR_LEFT,  INPUT);
   pinMode(SENSOR_MID,   INPUT);
   pinMode(SENSOR_RIGHT, INPUT);
@@ -581,6 +649,9 @@ void loop() {
   Serial.print(F("IR cmd received: 0x"));
   Serial.println(cmd, HEX);
 
+  currentCommandName = cmdName(cmd);
+  sendTelemetry("running", 0);
+
   if (cmd == CMD_1) {
     moveForwardBlocks(TARGET_BLOCKS_CMD1, SPEED_START_FAST, OFFSET_CMD1_MS); 
   } 
@@ -617,6 +688,7 @@ void loop() {
   else if (cmd == CMD_STAR) {
     car.Stop();
     Serial.println(F("E-STOP (idle)!"));
+    sendTelemetry("estop", -1);
   }
   else if (cmd == CMD_SEQ1) {
     runSequence1();
@@ -627,6 +699,9 @@ void loop() {
   else if (cmd == CMD_UP) {
     runSequence3();
   }
+
+  if (cmd != CMD_STAR) sendTelemetry("idle", -1);
+  currentCommandName = "IDLE";
 
   IrReceiver.resume();
 }

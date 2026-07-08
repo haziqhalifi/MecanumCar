@@ -55,6 +55,29 @@ Stopping a turn is decided by the sensors, not a fixed timer. Timing is only use
 - **Timing offsets**: `OFFSET_*_MS` — extra forward nudge after a maneuver finishes, to compensate for sensor-to-wheel-axle offset. `TURN_BLIND_MS`, `TURN_CENTER_DEBOUNCE_MS`, `TURN_CENTER_TIMEOUT_MS` — turn timing (see [Turning](#turning)).
 - **Block/marker counts**: `TARGET_BLOCKS_*`, `TARGET_MARKERS_CMD3`, `TARGET_STRAFE_CMD7/9` — how far each command travels.
 
+## Favoriot telemetry
+
+The Uno has no WiFi, so telemetry goes out over a dedicated `SoftwareSerial`
+link (pins 10/11, separate from the USB debug `Serial`) to a companion ESP32
+board running [esp32-wifi-bridge/](esp32-wifi-bridge/), which relays each line
+to Favoriot as a stream POST. See that folder's `include/secrets.h.example`
+for WiFi/API credentials setup (real `secrets.h` is gitignored).
+
+One JSON line is sent per state change — command start, block/junction
+progress, e-stop, and command finish — not continuously, to avoid interfering
+with IR decode timing:
+
+```json
+{"command":"CMD_1","status":"running","sensor_left":0,"sensor_mid":1,"sensor_right":0,"block_count":2}
+```
+
+`status` is one of `running`, `idle`, `estop`. `block_count` is `-1` when not
+applicable (e.g. on command start/finish) and `0` is never a meaningful block
+count that skips reporting — junction/marker counts start reporting at `1`.
+
+`lib/WifiToEsp32.cpp` is a leftover sketch from an earlier ultrasonic-sensor
+project and is superseded by `esp32-wifi-bridge/` for this project.
+
 ## Diagnostics
 
 `SENSOR_DIAGNOSTIC_MODE` (near `loop()`) — when set to `true`, prints `L=`, `M=`, `R=` sensor readings every 200ms to Serial instead of running normally. Useful for comparing how cleanly each sensor triggers when manually sliding the car over a line (e.g. to check if one edge sensor is dirtier/misaligned relative to the others). Set back to `false` for normal operation.
