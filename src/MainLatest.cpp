@@ -96,6 +96,9 @@ const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after
 #define OFFSET_STRAFE_R_MS         120   // Extra ms to keep strafing right after final line detection
 
 #define TURN_BLIND_MS              150   // Blind turn duration to clear the starting line
+#define TURN_CREEP_SPEED           40    // Slow speed used while centering on the target line
+#define TURN_CENTER_DEBOUNCE_MS    30    // How long MID must stay HIGH before accepting the center
+#define TURN_CENTER_TIMEOUT_MS     800   // Fallback: stop creeping after this long even if MID never centers
 
 // ── Turn Configuration ────────────────────────────────────────
 #define STOP_SENSOR_RIGHT_TURN  SENSOR_RIGHT
@@ -148,6 +151,38 @@ bool checkEstop() {
 // ================================================================
 //  ROTATION FUNCTIONS
 // ================================================================
+// After the edge sensor first sees the target line, creep slowly and wait
+// for SENSOR_MID to also read HIGH (debounced) so the car stops centered on
+// the line rather than the instant the edge sensor alone triggers. Falls
+// back to a timeout so a bad/dirty sensor can't hang the turn forever.
+// turnRight: true = keep turning right while centering, false = keep turning left.
+bool centerOnLine(bool turnRight) {
+  unsigned long centerStart = millis();
+  unsigned long midHighSince = 0;
+
+  while (true) {
+    if (checkEstop()) {
+      Serial.println(F("E-STOP!")); restoreIR(); return false;
+    }
+
+    setMotorSpeed(TURN_CREEP_SPEED);
+    if (turnRight) car.Turn_Right(); else car.Turn_Left();
+
+    if (digitalRead(SENSOR_MID) == HIGH) {
+      if (midHighSince == 0) midHighSince = millis();
+      if (millis() - midHighSince >= TURN_CENTER_DEBOUNCE_MS) break;
+    } else {
+      midHighSince = 0;
+    }
+
+    if (millis() - centerStart >= TURN_CENTER_TIMEOUT_MS) {
+      Serial.println(F("Center timeout - stopping at edge-sensor position"));
+      break;
+    }
+  }
+  return true;
+}
+
 bool rotateRight90() {
   Serial.println(F("\n--- Rotating 90 Degrees Right (Speed 60) ---"));
   // If already parked on a line (e.g. chained from a previous rotation), spin off it first
@@ -177,8 +212,9 @@ bool rotateRight90() {
       break;
     }
   }
+  if (!centerOnLine(true)) return false;
   car.Stop();
-  delay(200); 
+  delay(200);
   return true;
 }
 
@@ -211,8 +247,9 @@ bool rotateLeft90() {
       break;
     }
   }
+  if (!centerOnLine(false)) return false;
   car.Stop();
-  delay(200); 
+  delay(200);
   return true;
 }
 
@@ -513,7 +550,25 @@ void setup() {
   Serial.println(F("Ready."));
 }
 
+// Set to true to continuously print SENSOR_LEFT vs SENSOR_RIGHT readings
+// (once every 200ms) so you can compare how reliably each triggers HIGH
+// while sliding the car by hand over a line. Leave false for normal operation.
+#define SENSOR_DIAGNOSTIC_MODE  false
+
 void loop() {
+#if SENSOR_DIAGNOSTIC_MODE
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 200) {
+    lastPrint = millis();
+    Serial.print(F("L="));
+    Serial.print(digitalRead(SENSOR_LEFT));
+    Serial.print(F("  M="));
+    Serial.print(digitalRead(SENSOR_MID));
+    Serial.print(F("  R="));
+    Serial.println(digitalRead(SENSOR_RIGHT));
+  }
+#endif
+
   if (!IrReceiver.decode()) return;
 
   uint8_t cmd = IrReceiver.decodedIRData.command;
