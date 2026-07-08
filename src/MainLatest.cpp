@@ -184,6 +184,28 @@ const char* cmdName(uint8_t cmd) {
   }
 }
 
+// Inverse of cmdName(), used to map a remote command name (received from the
+// ESP32 bridge, originating from a Favoriot dashboard Control widget) back
+// to the IR command byte so it can be dispatched identically to a real
+// remote-control press. Returns 0x00 (unused by any real command) if the
+// name isn't recognized.
+uint8_t cmdFromName(const String& name) {
+  if (name == "CMD_STAR")     return CMD_STAR;
+  if (name == "CMD_1")        return CMD_1;
+  if (name == "CMD_2")        return CMD_2;
+  if (name == "CMD_3")        return CMD_3;
+  if (name == "CMD_ROTATE_R") return CMD_ROTATE_R;
+  if (name == "CMD_ROTATE_L") return CMD_ROTATE_L;
+  if (name == "CMD_UP")       return CMD_UP;
+  if (name == "CMD_180")      return CMD_180;
+  if (name == "CMD_7")        return CMD_7;
+  if (name == "CMD_180_ONLY") return CMD_180_ONLY;
+  if (name == "CMD_9")        return CMD_9;
+  if (name == "CMD_SEQ1")     return CMD_SEQ1;
+  if (name == "CMD_SEQ2")     return CMD_SEQ2;
+  return 0x00;
+}
+
 // Sends one JSON telemetry line to the ESP32 bridge, which wraps it as the
 // "data" object of a Favoriot stream POST. Called only on state changes
 // (command start/finish, block progress, e-stop) rather than continuously,
@@ -605,66 +627,25 @@ void runSequence4() {
 }
 
 // ================================================================
-//  SETUP & LOOP
+//  COMMAND DISPATCH (shared by IR remote and Favoriot dashboard control)
 // ================================================================
-void setup() {
-  Serial.begin(9600);
-  espSerial.begin(9600);
-  pinMode(SENSOR_LEFT,  INPUT);
-  pinMode(SENSOR_MID,   INPUT);
-  pinMode(SENSOR_RIGHT, INPUT);
-  car.Init();
-  IrReceiver.begin(RECV_PIN, false);
-  Serial.println(F("Ready."));
-}
-
-// Set to true to continuously print SENSOR_LEFT vs SENSOR_RIGHT readings
-// (once every 200ms) so you can compare how reliably each triggers HIGH
-// while sliding the car by hand over a line. Leave false for normal operation.
-#define SENSOR_DIAGNOSTIC_MODE  false
-
-void loop() {
-#if SENSOR_DIAGNOSTIC_MODE
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 200) {
-    lastPrint = millis();
-    Serial.print(F("L="));
-    Serial.print(digitalRead(SENSOR_LEFT));
-    Serial.print(F("  M="));
-    Serial.print(digitalRead(SENSOR_MID));
-    Serial.print(F("  R="));
-    Serial.println(digitalRead(SENSOR_RIGHT));
-  }
-#endif
-
-  if (!IrReceiver.decode()) return;
-
-  uint8_t cmd = IrReceiver.decodedIRData.command;
-
-  if (cmd == 0x00 || (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
-    IrReceiver.resume();
-    return;
-  }
-
-  Serial.print(F("IR cmd received: 0x"));
-  Serial.println(cmd, HEX);
-
+void dispatchCommand(uint8_t cmd) {
   currentCommandName = cmdName(cmd);
   sendTelemetry("running", 0);
 
   if (cmd == CMD_1) {
-    moveForwardBlocks(TARGET_BLOCKS_CMD1, SPEED_START_FAST, OFFSET_CMD1_MS); 
-  } 
+    moveForwardBlocks(TARGET_BLOCKS_CMD1, SPEED_START_FAST, OFFSET_CMD1_MS);
+  }
   else if (cmd == CMD_2) {
-    if (rotateRight90()) { 
-      moveForwardBlocks(TARGET_BLOCKS_CMD2, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS); 
+    if (rotateRight90()) {
+      moveForwardBlocks(TARGET_BLOCKS_CMD2, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
     }
-  } 
+  }
   else if (cmd == CMD_3) {
-    if (rotateLeft90()) { 
-      moveRightSideMarkers(TARGET_MARKERS_CMD3, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS); 
-    } 
-  } 
+    if (rotateLeft90()) {
+      moveRightSideMarkers(TARGET_MARKERS_CMD3, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
+    }
+  }
   else if (cmd == CMD_ROTATE_R) {
     runSequence4();
   }
@@ -702,6 +683,78 @@ void loop() {
 
   if (cmd != CMD_STAR) sendTelemetry("idle", -1);
   currentCommandName = "IDLE";
+}
+
+// Polls the ESP32 link for a remote command name (e.g. "CMD_1"), forwarded
+// from a Favoriot dashboard Control widget the ESP32 picked up by polling
+// Favoriot's REST API (see esp32-wifi-bridge/). Dispatches it exactly like
+// a real IR remote press.
+void checkRemoteCommand() {
+  if (!espSerial.available()) return;
+  String line = espSerial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  uint8_t cmd = cmdFromName(line);
+  if (cmd == 0x00) {
+    Serial.print(F("Unknown remote command: "));
+    Serial.println(line);
+    return;
+  }
+
+  Serial.print(F("Remote cmd received: "));
+  Serial.println(line);
+  dispatchCommand(cmd);
+}
+
+// ================================================================
+//  SETUP & LOOP
+// ================================================================
+void setup() {
+  Serial.begin(9600);
+  espSerial.begin(9600);
+  pinMode(SENSOR_LEFT,  INPUT);
+  pinMode(SENSOR_MID,   INPUT);
+  pinMode(SENSOR_RIGHT, INPUT);
+  car.Init();
+  IrReceiver.begin(RECV_PIN, false);
+  Serial.println(F("Ready."));
+}
+
+// Set to true to continuously print SENSOR_LEFT vs SENSOR_RIGHT readings
+// (once every 200ms) so you can compare how reliably each triggers HIGH
+// while sliding the car by hand over a line. Leave false for normal operation.
+#define SENSOR_DIAGNOSTIC_MODE  false
+
+void loop() {
+#if SENSOR_DIAGNOSTIC_MODE
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 200) {
+    lastPrint = millis();
+    Serial.print(F("L="));
+    Serial.print(digitalRead(SENSOR_LEFT));
+    Serial.print(F("  M="));
+    Serial.print(digitalRead(SENSOR_MID));
+    Serial.print(F("  R="));
+    Serial.println(digitalRead(SENSOR_RIGHT));
+  }
+#endif
+
+  checkRemoteCommand();
+
+  if (!IrReceiver.decode()) return;
+
+  uint8_t cmd = IrReceiver.decodedIRData.command;
+
+  if (cmd == 0x00 || (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+    IrReceiver.resume();
+    return;
+  }
+
+  Serial.print(F("IR cmd received: 0x"));
+  Serial.println(cmd, HEX);
+
+  dispatchCommand(cmd);
 
   IrReceiver.resume();
 }
