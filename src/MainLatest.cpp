@@ -6,7 +6,7 @@
     - Button 0: Emergency Stop.
     - Button 1: Move forward by TARGET_BLOCKS_CMD1 (4 blocks).
     - Button 2: Rotate Right, then move forward by TARGET_BLOCKS_CMD2 (2 blocks).
-    - Button 3: Rotate Left, then move by TARGET_MARKERS_CMD3 (2 markers).
+    - Button 3: Rotate Left, then move forward by TARGET_BLOCKS_CMD3 (2 blocks).
     - Button ROTATE_R (arrow): Same as Button 5, mirrored (turns swapped left<->right).
     - Button ROTATE_L (arrow): Same as Button 5.
     - Button 6: Spin 180 degrees, then move forward by TARGET_BLOCKS_CMD180.
@@ -16,6 +16,9 @@
     - Button 4: Sequence - forward 4, turn left, forward 2, turn right, forward 2, turn 180.
     - Button 5: Same as Button 4, then mirrored in reverse to return to the start location/heading.
     - Button UP (arrow): Sequence - forward 5, turn 180, forward 5.
+    - Before any 180-degree turn triggered by Up/Left/Right (arrow) buttons:
+      approach whatever is in front on the ultrasonic sensor and grab it,
+      regardless of color, before turning.
   ================================================================
 */
 
@@ -23,12 +26,24 @@
 #include <MecanumCar_v2.h>
 #include <IRremote.hpp>
 #include <SoftwareSerial.h>
+#include <Servo.h>
 
 // ── Hardware pins ─────────────────────────────────────────────
 #define RECV_PIN        A3
 #define SENSOR_LEFT     A0
 #define SENSOR_MID      A1
 #define SENSOR_RIGHT    A2
+
+// Color sensor (TCS3200), ultrasonic (HC-SR04), gripper servo — added for the
+// pre-180-turn grab. NOTE: the servo needs its own 5-6V supply with a common
+// ground; the Arduino 5V pin can't source a servo's stall current and doing
+// so can brown out the board (freezes Serial/everything).
+#define TCS_OUT_PIN           8
+#define TCS_S2_PIN            7
+#define TCS_S3_PIN            6
+#define GRIPPER_PIN           9
+#define ULTRASONIC_TRIG_PIN   12
+#define ULTRASONIC_ECHO_PIN   13
 
 // Dedicated link to the ESP32 WiFi bridge (see esp32-wifi-bridge/), kept
 // separate from the USB debug Serial so telemetry doesn't get mixed in with
@@ -58,11 +73,12 @@ extern uint8_t speed_Lower_R;
 #define CMD_9           0x5A // Digit 9 -> Strafe Right
 #define CMD_SEQ1        0x0C // Digit 4 -> Sequence: fwd 4, left, fwd 2, right, fwd 2, 180
 #define CMD_SEQ2        0x18 // Digit 5 -> Sequence 1, then mirrored in reverse back to start
+#define CMD_HASH        0x4A // '#' button -> release (open) the gripper
 
 // ── MOVEMENT SETTINGS / COUNTS ────────────────────────────────
 const int TARGET_BLOCKS_CMD1   = 4;  // How many blocks Button 1 moves forward
 const int TARGET_BLOCKS_CMD2   = 2;  // How many blocks Button 2 moves forward after turning
-const int TARGET_MARKERS_CMD3  = 2;  // How many right markers Button 3 counts after turning
+const int TARGET_BLOCKS_CMD3   = 2;  // How many blocks Button 3 moves forward after turning
 const int TARGET_STRAFE_CMD7   = 2;  // How many left junctions Button 7 counts while strafing left
 const int TARGET_STRAFE_CMD9   = 2;  // How many right junctions Button 9 counts while strafing right
 const int TARGET_BLOCKS_CMD180 = 2;  // How many blocks Button 180 moves forward after turning
@@ -72,11 +88,29 @@ const int TARGET_BLOCKS_SEQ1_C = 2;  // Sequence leg 3: forward blocks after rig
 const int TARGET_BLOCKS_SEQ2_FINAL = 5;  // Button 5: forward blocks on the final return leg
 const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after the 180 turn
 
+// ── GRAB (color + ultrasonic + gripper) ────────────────────────
+#define GRIPPER_OPEN_US        500   // Servo pulse width: fully open
+#define GRIPPER_CLOSE_US       1300  // Servo pulse width: hard max (stay within the servo's free range)
+#define GRIPPER_GRAB_US        1100  // Servo pulse width: grab position
+#define GRIPPER_MOVE_STEP      10    // us per micro-step when closing/opening gradually
+#define GRIPPER_MOVE_DT        15    // ms between micro-steps (gentler current draw than a jump)
+
+#define ULTRASONIC_TIMEOUT_US  30000UL   // pulseIn timeout for the HC-SR04 echo
+#define APPROACH_STOP_DISTANCE_CM  6.0   // stop-and-grab distance (accounts for gripper reach); kept above the HC-SR04's ~2-5cm blind zone so a clean reading usually triggers the stop before echo loss does
+#define APPROACH_SETTLE_MS     300       // pause after stopping / after grabbing
+#define APPROACH_TIMEOUT_MS    8000      // give up approaching if never in range this long
+#define NO_ECHO_STREAK_TO_GRAB 3         // consecutive no-echo reads (while approaching) before assuming "too close to read" and grabbing anyway
+#define BACKGROUND_GRAB_CHECK_MS 500     // how often to poll the ultrasonic for a block while idle (not mid-command)
+
+#define COLOR_PULSE_TIMEOUT_US 25000UL   // pulseIn timeout per TCS3200 color channel
+#define BRIGHTNESS_BLACK_MAX   300.0     // total intensity below this reads as BLACK regardless of ratio
+#define ACHROMATIC_TOLERANCE   0.08      // max/min ratio spread below this reads as WHITE (no dominant channel)
+
 // ── SPEED CONFIGURATIONS ──────────────────────────────────────
 #define SPEED_START_FAST       60    // Forward start speed for Button 1 (No turning)
-#define SPEED_POST_RIGHT_TURN  45    // Speed forward after turning RIGHT (Button 2)
-#define SPEED_POST_LEFT_TURN   40    // Speed forward after turning LEFT (Button 3)
-#define SPEED_POST_180_TURN    45    // Speed forward after 180-degree turn (Button 180)
+#define SPEED_POST_RIGHT_TURN  60    // Speed forward after turning RIGHT (Button 2)
+#define SPEED_POST_LEFT_TURN   60    // Speed forward after turning LEFT (Button 3)
+#define SPEED_POST_180_TURN    60    // Speed forward after 180-degree turn (Button 180)
 #define SPEED_STRAFE_LEFT      55    // Base starting speed for strafing left
 #define SPEED_STRAFE_RIGHT     55    // Base starting speed for strafing right
 
@@ -97,10 +131,11 @@ const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after
 #define STRAFE_R_BIAS_LR       -10     // Strafe Right - Lower Right Wheel PWM Offset
 
 // ── TIMING & NUDGE OFFSETS ────────────────────────────────────
-#define OFFSET_CMD1_MS             110   // Extra ms to drive forward at the end of Button 1
-#define OFFSET_POST_RIGHT_TURN_MS  150   // Extra ms to nudge forward after RIGHT movement finishes (Button 2)
-#define OFFSET_POST_LEFT_TURN_MS   130   // Extra ms to nudge forward after LEFT movement finishes (Button 3)
-#define OFFSET_POST_180_MS         150   // Extra ms to nudge forward after 180-degree turn (Button 180)
+#define OFFSET_CMD1_MS             250   // Extra ms to drive forward at the end of Button 1 (speed unchanged at 60, so offset unchanged)
+#define OFFSET_POST_RIGHT_TURN_MS  220   // Extra ms to nudge forward after RIGHT movement finishes (Button 2; also pre-turn in sequences) — scaled down from 290 since SPEED_POST_RIGHT_TURN went 45->60 (same PWM speed increase covers more distance per ms)
+#define OFFSET_POST_LEFT_TURN_MS   200   // Extra ms to nudge forward after LEFT movement finishes (Button 3; also pre-turn in sequences) — scaled down from 300 since SPEED_POST_LEFT_TURN went 40->60
+#define OFFSET_POST_180_MS         220   // Extra ms to nudge forward after 180-degree turn (Button 180; also pre-turn in sequences) — scaled down from 290 since SPEED_POST_180_TURN went 45->60
+#define OFFSET_PRE_180_MS          110   // Extra ms to nudge forward on the leg immediately before a 180-degree turn in sequences — kept separate from the 90-degree pre-turn offsets above; scaled down since the legs feeding into it now also run at 60
 #define OFFSET_STRAFE_L_MS         120   // Extra ms to keep strafing left after final line detection
 #define OFFSET_STRAFE_R_MS         120   // Extra ms to keep strafing right after final line detection
 
@@ -114,6 +149,27 @@ const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after
 #define STOP_SENSOR_LEFT_TURN   SENSOR_LEFT
 
 mecanumCar car(3, 2);
+
+Servo gripper;
+int gripperPosUs = GRIPPER_OPEN_US;
+
+// ── Color classification table (ratio-based, TCS3200) ──────────
+enum ColorID { COLOR_UNKNOWN = 0, COLOR_WHITE, COLOR_BLACK, COLOR_BLUE, COLOR_COUNT };
+const ColorID TARGET_COLOR = COLOR_BLUE; // only this color triggers a grab before turning
+
+struct ColorProfile {
+  const char* name;
+  float rRatioMin, rRatioMax;
+  float gRatioMin, gRatioMax;
+  float bRatioMin, bRatioMax;
+};
+
+ColorProfile colorProfiles[COLOR_COUNT] = {
+  /* UNKNOWN */ { "UNKNOWN", 0.0, 1.0, 0.0, 1.0, 0.0, 1.0 },
+  /* WHITE   */ { "WHITE",   0.0, 1.0, 0.0, 1.0, 0.0, 1.0 },
+  /* BLACK   */ { "BLACK",   0.0, 1.0, 0.0, 1.0, 0.0, 1.0 },
+  /* BLUE    */ { "BLUE",    0.00, 0.30, 0.00, 0.40, 0.40, 1.00 },
+};
 
 // ================================================================
 //  HELPERS
@@ -158,6 +214,77 @@ bool checkEstop() {
 }
 
 // ================================================================
+//  COLOR SENSOR (TCS3200) / ULTRASONIC (HC-SR04) / GRIPPER
+// ================================================================
+// Moves the gripper gradually to targetUs (gentler current draw than a jump).
+void gripperMoveTo(int targetUs) {
+  targetUs = constrain(targetUs, GRIPPER_OPEN_US, GRIPPER_CLOSE_US);
+  int step = (targetUs >= gripperPosUs) ? GRIPPER_MOVE_STEP : -GRIPPER_MOVE_STEP;
+  while (gripperPosUs != targetUs) {
+    gripperPosUs += step;
+    if ((step > 0 && gripperPosUs > targetUs) || (step < 0 && gripperPosUs < targetUs)) gripperPosUs = targetUs;
+    gripper.writeMicroseconds(gripperPosUs);
+    delay(GRIPPER_MOVE_DT);
+  }
+}
+
+void readColorRaw(uint16_t &rPulse, uint16_t &gPulse, uint16_t &bPulse) {
+  digitalWrite(TCS_S2_PIN, LOW);  digitalWrite(TCS_S3_PIN, LOW);  delayMicroseconds(50);
+  rPulse = pulseIn(TCS_OUT_PIN, HIGH, COLOR_PULSE_TIMEOUT_US);
+  digitalWrite(TCS_S2_PIN, LOW);  digitalWrite(TCS_S3_PIN, HIGH); delayMicroseconds(50);
+  bPulse = pulseIn(TCS_OUT_PIN, HIGH, COLOR_PULSE_TIMEOUT_US);
+  digitalWrite(TCS_S2_PIN, HIGH); digitalWrite(TCS_S3_PIN, HIGH); delayMicroseconds(50);
+  gPulse = pulseIn(TCS_OUT_PIN, HIGH, COLOR_PULSE_TIMEOUT_US);
+
+  if (rPulse == 0) rPulse = COLOR_PULSE_TIMEOUT_US;
+  if (gPulse == 0) gPulse = COLOR_PULSE_TIMEOUT_US;
+  if (bPulse == 0) bPulse = COLOR_PULSE_TIMEOUT_US;
+}
+
+ColorID classifyColor() {
+  uint16_t rPulse, gPulse, bPulse;
+  readColorRaw(rPulse, gPulse, bPulse);
+
+  float rIntensity = 1000000.0 / rPulse;
+  float gIntensity = 1000000.0 / gPulse;
+  float bIntensity = 1000000.0 / bPulse;
+  float total = rIntensity + gIntensity + bIntensity;
+
+  float rRatio = rIntensity / total;
+  float gRatio = gIntensity / total;
+  float bRatio = bIntensity / total;
+
+  ColorID label = COLOR_UNKNOWN;
+  if (total < BRIGHTNESS_BLACK_MAX) {
+    label = COLOR_BLACK;
+  } else {
+    float maxRatio = max(rRatio, max(gRatio, bRatio));
+    float minRatio = min(rRatio, min(gRatio, bRatio));
+    if ((maxRatio - minRatio) < ACHROMATIC_TOLERANCE) {
+      label = COLOR_WHITE;
+    } else if (rRatio >= colorProfiles[COLOR_BLUE].rRatioMin && rRatio <= colorProfiles[COLOR_BLUE].rRatioMax &&
+               gRatio >= colorProfiles[COLOR_BLUE].gRatioMin && gRatio <= colorProfiles[COLOR_BLUE].gRatioMax &&
+               bRatio >= colorProfiles[COLOR_BLUE].bRatioMin && bRatio <= colorProfiles[COLOR_BLUE].bRatioMax) {
+      label = COLOR_BLUE;
+    }
+  }
+
+  Serial.print(F("[COLOR] ratio R/G/B: "));
+  Serial.print(rRatio, 2); Serial.print('/'); Serial.print(gRatio, 2); Serial.print('/'); Serial.print(bRatio, 2);
+  Serial.print(F(" -> ")); Serial.println(colorProfiles[label].name);
+  return label;
+}
+
+float readUltrasonicDistanceCM() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (duration == 0) return -1.0;
+  return (float)duration / 58.0;
+}
+
+// ================================================================
 //  FAVORIOT TELEMETRY (via ESP32 WiFi bridge)
 // ================================================================
 // Name of the IR command currently executing, used to label telemetry
@@ -180,6 +307,7 @@ const char* cmdName(uint8_t cmd) {
     case CMD_9:        return "CMD_9";
     case CMD_SEQ1:     return "CMD_SEQ1";
     case CMD_SEQ2:     return "CMD_SEQ2";
+    case CMD_HASH:     return "CMD_HASH";
     default:           return "UNKNOWN";
   }
 }
@@ -203,6 +331,7 @@ uint8_t cmdFromName(const String& name) {
   if (name == "CMD_9")        return CMD_9;
   if (name == "CMD_SEQ1")     return CMD_SEQ1;
   if (name == "CMD_SEQ2")     return CMD_SEQ2;
+  if (name == "CMD_HASH")     return CMD_HASH;
   return 0x00;
 }
 
@@ -231,6 +360,112 @@ void reportEstop() {
   Serial.println(F("E-STOP!"));
   restoreIR();
   sendTelemetry("estop", -1);
+}
+
+// Creeps forward on the ultrasonic reading until within grab range (or times
+// out), then closes the gripper. Grabs whatever is there regardless of
+// color. Called only from grabBlockInFront() below.
+void approachAndGrab() {
+  Serial.println(F(">>> Approaching to grab <<<"));
+  car.Stop();
+  delay(150);
+
+  unsigned long approachStart = millis();
+  bool reachedTarget = false;
+  int noEchoStreak = 0;
+
+  while (millis() - approachStart < APPROACH_TIMEOUT_MS) {
+    if (checkEstop()) {
+      reportEstop();
+      return;
+    }
+
+    float distanceCm = readUltrasonicDistanceCM();
+    Serial.print(F("[APPROACH] dist: "));
+    if (distanceCm < 0) Serial.println(F("no echo")); else { Serial.print(distanceCm); Serial.println(F("cm")); }
+
+    if (distanceCm > 0 && distanceCm <= APPROACH_STOP_DISTANCE_CM) {
+      Serial.print(F("[APPROACH] Reached ")); Serial.print(distanceCm); Serial.println(F("cm - grabbing."));
+      reachedTarget = true;
+      break;
+    }
+
+    if (distanceCm < 0) {
+      // No echo: either nothing is there yet, or (much more likely once
+      // we've been advancing) the block is now inside the HC-SR04's blind
+      // zone (~2-5cm) where it physically can't get a valid echo back.
+      // Don't blindly keep driving on missing data — that's what was
+      // causing the car to crash into the block instead of stopping.
+      // A few consecutive no-echo reads after we've started closing in
+      // is treated as "too close to read" == close enough to grab.
+      noEchoStreak++;
+      if (noEchoStreak >= NO_ECHO_STREAK_TO_GRAB) {
+        Serial.println(F("[APPROACH] Repeated no-echo (likely inside blind zone) - grabbing."));
+        reachedTarget = true;
+        break;
+      }
+      delay(60); // hold position and retry, instead of advancing on bad data
+      continue;
+    }
+    noEchoStreak = 0;
+
+    setMotorSpeed(SPEED_MIN); car.Advance(); delay(60);
+  }
+
+  car.Stop();
+  delay(APPROACH_SETTLE_MS);
+
+  if (reachedTarget) {
+    gripperMoveTo(GRIPPER_GRAB_US);
+    Serial.println(F("[GRIPPER] Grabbed."));
+    delay(APPROACH_SETTLE_MS);
+  } else {
+    Serial.println(F("[APPROACH] Timeout - never reached range, no grab."));
+  }
+
+  restoreIR();
+}
+
+// Approaches and grabs whatever is in front, regardless of color, before the
+// caller proceeds to a 180-degree turn. The color reading is logged for
+// diagnostics only — it no longer gates whether the grab happens.
+void grabBlockInFront() {
+  Serial.println(F("[GRAB] Reading color (diagnostic only, no longer gates the grab)..."));
+  classifyColor();
+  approachAndGrab();
+}
+
+// Polled from loop() only while idle (movement functions are blocking, so
+// this naturally never runs mid-command). Every BACKGROUND_GRAB_CHECK_MS,
+// checks the ultrasonic; if something is already within grab range and the
+// gripper isn't already holding something, grabs it — no button press
+// needed. Scoped to "already close" rather than "detected at any range" so
+// the car doesn't autonomously drive across the room toward something it
+// merely sees; it only reacts to a block already right in front of it.
+// LIMITATION: there's currently no button wired to reopen the gripper, so
+// this only fires once per power-on until something manually re-opens it.
+void checkBackgroundGrab() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < BACKGROUND_GRAB_CHECK_MS) return;
+  lastCheck = millis();
+
+  float distanceCm = readUltrasonicDistanceCM();
+  bool blockSeen = (distanceCm > 0 && distanceCm <= APPROACH_STOP_DISTANCE_CM);
+
+  // Always logged (even when the gripper is already holding something and
+  // no grab will be attempted) so the ultrasonic's live reading is visible
+  // on Serial for debugging sensor behavior/placement.
+  Serial.print(F("[BACKGROUND] dist: "));
+  if (distanceCm < 0) Serial.print(F("no echo")); else { Serial.print(distanceCm); Serial.print(F("cm")); }
+  Serial.print(F(" -> block "));
+  Serial.println(blockSeen ? F("DETECTED") : F("not detected"));
+
+  if (gripperPosUs != GRIPPER_OPEN_US) return; // already holding something
+
+  if (blockSeen) {
+    Serial.println(F("[BACKGROUND] Block detected while idle -> grabbing."));
+    grabBlockInFront();
+  }
 }
 
 // ================================================================
@@ -348,9 +583,9 @@ bool rotate180() {
 // ================================================================
 //  LINE TRACKING FORWARD MOVEMENTS
 // ================================================================
-void moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
+int moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
   int junctionCount = 0;
-  bool onJunction = true; 
+  bool onJunction = true;
 
   while (junctionCount < targetBlocks) {
     uint8_t L = digitalRead(SENSOR_LEFT);
@@ -365,7 +600,6 @@ void moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
       if (!onJunction) {
         junctionCount++;
         onJunction = true;
-        sendTelemetry("running", junctionCount);
         if (junctionCount == targetBlocks) break;
       }
       setMotorSpeed(currentSpeed); car.Advance();
@@ -399,62 +633,13 @@ void moveForwardBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
     setMotorSpeed(SPEED_MIN); car.Advance(); delay(endOffsetMs);
   }
   restoreIR();
-}
-
-void moveRightSideMarkers(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
-  int markerCount = 0;
-  bool onMarker = true; 
-
-  while (markerCount < targetBlocks) {
-    uint8_t L = digitalRead(SENSOR_LEFT);
-    uint8_t M = digitalRead(SENSOR_MID);
-    uint8_t R = digitalRead(SENSOR_RIGHT);
-
-    int calculatedSpeed = startSpeed - (markerCount * 5);
-    if (calculatedSpeed < SPEED_MIN) calculatedSpeed = SPEED_MIN;
-    uint8_t currentSpeed = (uint8_t)calculatedSpeed;
-
-    if (M == HIGH && R == HIGH) {
-      if (!onMarker) {
-        markerCount++;
-        onMarker = true;
-        sendTelemetry("running", markerCount);
-        if (markerCount == targetBlocks) break;
-      }
-      setMotorSpeed(currentSpeed); car.Advance();                  
-    } 
-    else if (L == LOW && M == HIGH && R == LOW) {
-      onMarker = false; setMotorSpeed(currentSpeed); car.Advance();                  
-    }
-    else if (L == LOW && M == LOW && R == HIGH) {
-      onMarker = false; setMotorSpeed(currentSpeed + 10); car.Turn_Right();               
-    }
-    else if (L == HIGH && M == LOW && R == LOW) {
-      onMarker = false; setMotorSpeed(currentSpeed + 10); car.Turn_Left();                
-    }
-    else if (L == LOW && M == LOW && R == LOW) {
-      onMarker = false; setMotorSpeed(currentSpeed); car.Advance();                  
-    }
-    else if (L == HIGH && M == HIGH && R == LOW) {
-      onMarker = false; setMotorSpeed(currentSpeed + 10); car.Turn_Left();
-    }
-
-    if (IrReceiver.decode()) {
-      if (IrReceiver.decodedIRData.command == CMD_STAR) break; 
-      IrReceiver.resume();
-    }
-  }
-
-  if (markerCount == targetBlocks && endOffsetMs > 0) {
-    setMotorSpeed(SPEED_MIN); car.Advance(); delay(endOffsetMs); 
-  }
-  restoreIR(); 
+  return junctionCount;
 }
 
 // ================================================================
 //  STRAFE LEFT MOVEMENT (Counts via SENSOR_LEFT Only)
 // ================================================================
-void strafeLeftBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
+int strafeLeftBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
   int junctionCount = 0;
   bool onJunction = true;
 
@@ -472,7 +657,6 @@ void strafeLeftBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
         junctionCount++;
         Serial.print(F("Left Sensor Hit! Total: ")); Serial.println(junctionCount);
         onJunction = true;
-        sendTelemetry("running", junctionCount);
         if (junctionCount == targetBlocks) break;
       }
     } else {
@@ -494,12 +678,13 @@ void strafeLeftBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
     delay(endOffsetMs);
   }
   restoreIR();
+  return junctionCount;
 }
 
 // ================================================================
 //  STRAFE RIGHT MOVEMENT (Counts via SENSOR_RIGHT Only)
 // ================================================================
-void strafeRightBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
+int strafeRightBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
   int junctionCount = 0;
   bool onJunction = true;
 
@@ -517,7 +702,6 @@ void strafeRightBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
         junctionCount++;
         Serial.print(F("Right Sensor Hit! Total: ")); Serial.println(junctionCount);
         onJunction = true;
-        sendTelemetry("running", junctionCount);
         if (junctionCount == targetBlocks) break;
       }
     } else {
@@ -539,6 +723,7 @@ void strafeRightBlocks(int targetBlocks, uint8_t startSpeed, int endOffsetMs) {
     delay(endOffsetMs);
   }
   restoreIR();
+  return junctionCount;
 }
 
 // ================================================================
@@ -555,7 +740,7 @@ void runSequence1() {
   delay(1000);
   if (!rotateRight90()) return;
   delay(1000);
-  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_RIGHT_TURN, OFFSET_PRE_180_MS);
   delay(1000);
   rotate180();
 }
@@ -572,8 +757,9 @@ void runSequence2() {
   delay(1000);
   if (!rotateRight90()) return;
   delay(1000);
-  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_RIGHT_TURN, OFFSET_PRE_180_MS);
   delay(1000);
+  grabBlockInFront();
   if (!rotate180()) return;
   delay(1000);
   // Reverse leg: retrace forward 2 -> left -> forward 2 -> right -> forward 5, back to start.
@@ -591,8 +777,9 @@ void runSequence2() {
 // Button UP: forward 5, turn 180, forward 5.
 // Aborts early (leaving the car stopped) if the turn is interrupted by E-STOP.
 void runSequence3() {
-  moveForwardBlocks(TARGET_BLOCKS_SEQ3, SPEED_START_FAST, OFFSET_CMD1_MS);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ3, SPEED_START_FAST, OFFSET_PRE_180_MS);
   delay(1000);
+  grabBlockInFront();
   if (!rotate180()) return;
   delay(1000);
   moveForwardBlocks(TARGET_BLOCKS_SEQ3, SPEED_POST_180_TURN, OFFSET_POST_180_MS);
@@ -610,8 +797,9 @@ void runSequence4() {
   delay(1000);
   if (!rotateLeft90()) return;
   delay(1000);
-  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
+  moveForwardBlocks(TARGET_BLOCKS_SEQ1_C, SPEED_POST_LEFT_TURN, OFFSET_PRE_180_MS);
   delay(1000);
+  grabBlockInFront();
   if (!rotate180()) return;
   delay(1000);
   // Reverse leg: retrace forward 2 -> right -> forward 2 -> left -> forward 5, back to start.
@@ -633,17 +821,19 @@ void dispatchCommand(uint8_t cmd) {
   currentCommandName = cmdName(cmd);
   sendTelemetry("running", 0);
 
+  int finalBlockCount = -1;
+
   if (cmd == CMD_1) {
-    moveForwardBlocks(TARGET_BLOCKS_CMD1, SPEED_START_FAST, OFFSET_CMD1_MS);
+    finalBlockCount = moveForwardBlocks(TARGET_BLOCKS_CMD1, SPEED_START_FAST, OFFSET_CMD1_MS);
   }
   else if (cmd == CMD_2) {
     if (rotateRight90()) {
-      moveForwardBlocks(TARGET_BLOCKS_CMD2, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
+      finalBlockCount = moveForwardBlocks(TARGET_BLOCKS_CMD2, SPEED_POST_RIGHT_TURN, OFFSET_POST_RIGHT_TURN_MS);
     }
   }
   else if (cmd == CMD_3) {
     if (rotateLeft90()) {
-      moveRightSideMarkers(TARGET_MARKERS_CMD3, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
+      finalBlockCount = moveForwardBlocks(TARGET_BLOCKS_CMD3, SPEED_POST_LEFT_TURN, OFFSET_POST_LEFT_TURN_MS);
     }
   }
   else if (cmd == CMD_ROTATE_R) {
@@ -654,17 +844,17 @@ void dispatchCommand(uint8_t cmd) {
   }
   else if (cmd == CMD_180) {
     if (rotate180()) {
-      moveForwardBlocks(TARGET_BLOCKS_CMD180, SPEED_POST_180_TURN, OFFSET_POST_180_MS);
+      finalBlockCount = moveForwardBlocks(TARGET_BLOCKS_CMD180, SPEED_POST_180_TURN, OFFSET_POST_180_MS);
     }
   }
   else if (cmd == CMD_180_ONLY) {
     rotate180();
   }
   else if (cmd == CMD_7) {
-    strafeLeftBlocks(TARGET_STRAFE_CMD7, SPEED_STRAFE_LEFT, OFFSET_STRAFE_L_MS);
+    finalBlockCount = strafeLeftBlocks(TARGET_STRAFE_CMD7, SPEED_STRAFE_LEFT, OFFSET_STRAFE_L_MS);
   }
   else if (cmd == CMD_9) {
-    strafeRightBlocks(TARGET_STRAFE_CMD9, SPEED_STRAFE_RIGHT, OFFSET_STRAFE_R_MS);
+    finalBlockCount = strafeRightBlocks(TARGET_STRAFE_CMD9, SPEED_STRAFE_RIGHT, OFFSET_STRAFE_R_MS);
   }
   else if (cmd == CMD_STAR) {
     car.Stop();
@@ -680,8 +870,12 @@ void dispatchCommand(uint8_t cmd) {
   else if (cmd == CMD_UP) {
     runSequence3();
   }
+  else if (cmd == CMD_HASH) {
+    gripperMoveTo(GRIPPER_OPEN_US);
+    Serial.println(F("[GRIPPER] Released (opened)."));
+  }
 
-  if (cmd != CMD_STAR) sendTelemetry("idle", -1);
+  if (cmd != CMD_STAR) sendTelemetry("idle", finalBlockCount);
   currentCommandName = "IDLE";
 }
 
@@ -718,6 +912,18 @@ void setup() {
   pinMode(SENSOR_RIGHT, INPUT);
   car.Init();
   IrReceiver.begin(RECV_PIN, false);
+
+  pinMode(TCS_S2_PIN, OUTPUT);
+  pinMode(TCS_S3_PIN, OUTPUT);
+  pinMode(TCS_OUT_PIN, INPUT);
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  gripper.attach(GRIPPER_PIN, GRIPPER_OPEN_US, GRIPPER_CLOSE_US);
+  gripper.writeMicroseconds(GRIPPER_OPEN_US);
+  gripperPosUs = GRIPPER_OPEN_US;
+
   Serial.println(F("Ready."));
 }
 
@@ -741,6 +947,7 @@ void loop() {
 #endif
 
   checkRemoteCommand();
+  checkBackgroundGrab();
 
   if (!IrReceiver.decode()) return;
 
