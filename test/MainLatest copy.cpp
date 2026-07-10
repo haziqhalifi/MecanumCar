@@ -56,7 +56,7 @@ const uint8_t CLAW_OPEN_ANGLE = 20;
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 const uint8_t SPEED_REVERSE_BUMP = 60; 
 const unsigned long REVERSE_BUMP_MS = 100; 
-const int CMD_STAR = 0x42; 
+const int CMD_STAR = 0x42; // Digit 0 on this remote -> cancel / emergency stop
 
 // ── Forward Declarations ────────────────────────────────────────────────────
 int gridGetDistanceCm();
@@ -335,11 +335,43 @@ bool isGrabTargetReached(int currentDistance) {
 void executeApproachMovement(int currentDistance) {
     if (emergencyStopActive) return;
     uint8_t approachSpeed;
-    
-    // 1. Calculate dynamic approach speed (Keep this exactly the same)
-    if (currentDistance <= 0) approachSpeed = 25;
-    else {
-      if (checkEmergencyStop()) return;
+
+    // Calculate dynamic approach speed: slow down as the item gets closer
+    if (currentDistance <= 0) approachSpeed = SPEED_START_SLOW;
+    else if (currentDistance <= GRAB_APPROACH_DISTANCE_CM * 2) approachSpeed = SPEED_MIN;
+    else approachSpeed = SPEED_START_SLOW;
+
+    gridSetSpeed(approachSpeed);
+    mecCar.Advance();
+}
+
+// Rotates in place from currentHeading to targetHeading, choosing the
+// shorter direction, and updates currentHeading to match.
+void turnToHeading(int targetHeading) {
+    if (checkEmergencyStop()) return;
+    while (currentHeading != targetHeading) {
+        if (checkEmergencyStop()) return;
+        int diff = (targetHeading - currentHeading + 4) % 4;
+        if (diff == 3) { // one step counter-clockwise is shorter than 3 clockwise
+            if (!gridRotateLeft90()) return;
+            currentHeading = (currentHeading + 3) % 4;
+        } else {
+            if (!gridRotateRight90()) return;
+            currentHeading = (currentHeading + 1) % 4;
+        }
+    }
+}
+
+// Walks the tracked grid position to (targetX, targetY): first along X
+// (EAST/WEST), then along Y (NORTH/SOUTH), one coordinate cell at a time.
+void moveCoord(int targetX, int targetY) {
+    if (checkEmergencyStop()) return;
+
+    int deltaX = targetX - currentX;
+    if (deltaX != 0) {
+        turnToHeading((deltaX > 0) ? EAST : WEST);
+        for (int i = 0; i < abs(deltaX); i++) {
+            if (checkEmergencyStop()) return;
             gridMoveForwardOneCoord(SPEED_START_FAST);
             if (emergencyStopActive) return;
             currentX += (currentHeading == EAST) ? 1 : -1;
@@ -360,6 +392,23 @@ void executeApproachMovement(int currentDistance) {
     Serial.println(F("[NAVIGATE] Target Node Reached. Aligning to WEST baseline..."));
     turnToHeading(WEST);
     gridStop();
+}
+
+// Creeps forward on the ultrasonic reading until within grab range (or the
+// item disappears from view), then closes the claw on the target color.
+void moveToGrab(int targetColor) {
+    if (checkEmergencyStop()) return;
+    Serial.println(F("[GRAB] Approaching item..."));
+
+    while (true) {
+        if (checkEmergencyStop()) return;
+        int distance = gridGetDistanceCm();
+        if (isGrabTargetReached(distance)) break;
+        executeApproachMovement(distance);
+    }
+
+    gridStop();
+    grabColor(targetColor);
 }
 
 void moveHome() {
@@ -412,24 +461,37 @@ void resetCoordinates() {
 enum Action { FWD, LFT, RGT, GRB, REV, DRP, GDR, DLY };
 struct Step { Action act; uint8_t arg; };
 
+// Drives out to the checkpoint and retraces the same route back, without
+// grabbing or dropping anything.
 const Step path1[] = {
+    // Outbound: FWD2 -> LFT -> FWD2 -> RGT -> FWD2 (reach checkpoint)
     {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
-    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, {RGT, 0}, 
-    {DLY, 5}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
-    {REV, 2}
+    {FWD, 2}, {DLY, 3},
+    // Turn around and retrace the outbound path back to the start
+    {RGT, 0}, {DLY, 3}, {RGT, 0}, {DLY, 3},
+    {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
+    {FWD, 2}
 };
 
+// Drives straight forward to the checkpoint and back, without grabbing or
+// dropping anything.
 const Step path2[] = {
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, 
-    {RGT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
-    {REV, 2}
+    {FWD, 4}, {DLY, 3},
+    // Turn around and drive straight back to the start
+    {RGT, 0}, {DLY, 3}, {RGT, 0}, {DLY, 3},
+    {FWD, 4}
 };
 //GDR was = 0
+// Mirror image of path1: drives out to its checkpoint and retraces the same
+// route back, without grabbing or dropping anything.
 const Step path3[] = {
-    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, 
-    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {LFT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},{LFT, 0}, 
-    {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
-    {REV, 2}
+    // Outbound: FWD2 -> RGT -> FWD2 -> LFT -> FWD2 (reach checkpoint)
+    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    {FWD, 2}, {DLY, 3},
+    // Turn around and retrace the outbound path back to the start
+    {LFT, 0}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    {FWD, 2}
 };
 
 // Add 'int targetColour' to the parameters
@@ -501,7 +563,7 @@ void loop() {
         if (key == CMD_STAR) {
             emergencyStopActive = true;
             gridStop();
-            Serial.println(F("\n!!! EMERGENCY STOP TRIGGERED VIA LOOP !!!"));
+            Serial.println(F("\n!!! CANCEL (button 0) - EMERGENCY STOP TRIGGERED !!!"));
             IrReceiver.resume();
             return;
         }
