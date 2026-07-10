@@ -47,16 +47,33 @@ int currentHeading = WEST;
 
 
 // ── Tuning Constants ───────────────────────────────────────────────────────
-const uint8_t SPEED_START_FAST = 50;
-const uint8_t SPEED_START_SLOW = 40;
-const uint8_t SPEED_MIN = 35;
+const uint8_t SPEED_START_FAST = 60;
+const uint8_t SPEED_START_SLOW = 50;
+const uint8_t SPEED_MIN = 45;
+// Extra speed added to a line-follow CORRECTION turn over the forward speed.
+// A bang-bang follower drives straight and yanks left/right to recover; at high
+// forward speed a same-speed correction is too weak, so the car weaves and can
+// sling off the line. Turning HARDER than it drives catches drift in one move.
+const uint8_t TURN_CORRECTION_BOOST = 12;
 const unsigned long CENTER_OFFSET_MS = 110;
 const uint8_t SPEED_ROTATE = 60;
-const unsigned long TURN_BLIND_MS = 150;
-const unsigned long BRAKE_MS = 40;
+// Blind-spin duration before we start hunting for the new perpendicular line.
+// Must be long enough to rotate PAST the too-early black detection (car stops
+// short if this is too small). Tune per surface/battery: raise if it still
+// under-rotates, lower if it overshoots.
+//
+// The LEFT turn used to stop short because it broke on the offset LEFT sensor,
+// which reaches the perpendicular line before the body has rotated a full 90.
+// It now stops on the CENTER sensor (on the rotation axis), which crosses the
+// line at a true ~90, so LEFT no longer needs an inflated blind time. The blind
+// window only has to carry the center sensor OFF the starting junction black
+// onto white before hunting begins.
+const unsigned long TURN_BLIND_LEFT_MS  = 350;
+const unsigned long TURN_BLIND_RIGHT_MS = 350;
+const unsigned long BRAKE_MS = 55;
 const int ITEM_DETECT_DISTANCE_CM = 25;
-const int GRAB_APPROACH_DISTANCE_CM = 6;
-const uint8_t CLAW_OPEN_ANGLE = 20;
+const int GRAB_APPROACH_DISTANCE_CM = 4;   // close the claw at <= 4cm
+const uint8_t CLAW_OPEN_ANGLE = 10;        // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 const uint8_t SPEED_REVERSE_BUMP = 60; 
 const unsigned long REVERSE_BUMP_MS = 100; 
@@ -135,18 +152,18 @@ bool checkEmergencyStop() {
 bool gridRotateLeft90() {
     if (checkEmergencyStop()) return false;
     Serial.println(F("\n[TURN] Symmetrical Spin 90 Degrees Left..."));
-    unsigned long telemetryTickMillis = millis();
+    // NOTE: no telemetry reads inside the spin loops — the ultrasonic/color
+    // pulseIn calls block for tens of ms and make the turn angle inconsistent.
     unsigned long startTime = millis();
-    while (millis() - startTime < TURN_BLIND_MS) {
+    spinLeftInPlace(SPEED_ROTATE);
+    while (millis() - startTime < TURN_BLIND_LEFT_MS) {
         if (checkEmergencyStop()) return false;
-        spinLeftInPlace(SPEED_ROTATE);
-        motionTelemetryTick(telemetryTickMillis);
     }
+    // Stop on the CENTER sensor, not the offset LEFT sensor: center is on the
+    // rotation axis so it reaches the new perpendicular line at a true ~90.
     while (true) {
         if (checkEmergencyStop()) return false;
-        spinLeftInPlace(SPEED_ROTATE);
-        motionTelemetryTick(telemetryTickMillis);
-        if (digitalRead(LINE_LEFT_PIN) == HIGH) break;
+        if (digitalRead(LINE_CENTER_PIN) == HIGH) break;
     }
     spinRightInPlace(SPEED_ROTATE + 10);
     
@@ -163,17 +180,15 @@ bool gridRotateLeft90() {
 bool gridRotateRight90() {
     if (checkEmergencyStop()) return false;
     Serial.println(F("\n[TURN] Symmetrical Spin 90 Degrees Right..."));
-    unsigned long telemetryTickMillis = millis();
+    // NOTE: no telemetry reads inside the spin loops — the ultrasonic/color
+    // pulseIn calls block for tens of ms and make the turn angle inconsistent.
     unsigned long startTime = millis();
-    while (millis() - startTime < TURN_BLIND_MS) {
+    spinRightInPlace(SPEED_ROTATE);
+    while (millis() - startTime < TURN_BLIND_RIGHT_MS) {
         if (checkEmergencyStop()) return false;
-        spinRightInPlace(SPEED_ROTATE);
-        motionTelemetryTick(telemetryTickMillis);
     }
     while (true) {
         if (checkEmergencyStop()) return false;
-        spinRightInPlace(SPEED_ROTATE);
-        motionTelemetryTick(telemetryTickMillis);
         if (digitalRead(LINE_RIGHT_PIN) == HIGH) break;
     }
     spinLeftInPlace(SPEED_ROTATE + 10);
@@ -214,15 +229,15 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         } else if (Left == LOW && Center == HIGH && Right == LOW) {
             onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
         } else if (Left == LOW && Center == LOW && Right == HIGH) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Turn_Right();
+            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right();
         } else if (Left == HIGH && Center == LOW && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Turn_Left();
+            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left();
         } else if (Left == LOW && Center == LOW && Right == LOW) {
             onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
         } else if (Left == HIGH && Center == HIGH && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Turn_Left();
+            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left();
         } else if (Left == LOW && Center == HIGH && Right == HIGH) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Turn_Right();
+            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right();
         }
 
         motionTelemetryTick(telemetryTickMillis);
@@ -264,11 +279,11 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         if (Left == HIGH && Center == HIGH && Right == HIGH) break;
         else if (Left == LOW && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
 
-        else if (Left == LOW && Center == LOW && Right == HIGH) { gridSetSpeed(startSpeed); mecCar.Turn_Right(); }
-        else if (Left == HIGH && Center == LOW && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Turn_Left(); }
+        else if (Left == LOW && Center == LOW && Right == HIGH) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right(); }
+        else if (Left == HIGH && Center == LOW && Right == LOW) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left(); }
         else if (Left == LOW && Center == LOW && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
-        else if (Left == HIGH && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Turn_Left(); }
-        else if (Left == LOW && Center == HIGH && Right == HIGH) { gridSetSpeed(startSpeed); mecCar.Turn_Right(); }
+        else if (Left == HIGH && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left(); }
+        else if (Left == LOW && Center == HIGH && Right == HIGH) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right(); }
 
         motionTelemetryTick(telemetryTickMillis);
     }
@@ -284,6 +299,14 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
 
 int gridGetDistanceCm() {
     if (!sensorsEnabled || emergencyStopActive) return -1;
+    // Re-assert the ultrasonic pin modes on every read. Something between
+    // setup() and here (servo attach/detach, IR begin, or the bit-banged
+    // I2C motor bus toggling SDA/SCL) can leave TRIG/ECHO in the wrong mode,
+    // which makes pulseIn() return 0 forever (distance shows "---"). The
+    // working Ultrasonic+Color+Gripper sketch re-asserts these before each
+    // ping too.
+    pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+    pinMode(ULTRASONIC_ECHO_PIN, INPUT);
     digitalWrite(ULTRASONIC_TRIG_PIN, LOW); delayMicroseconds(2);
     digitalWrite(ULTRASONIC_TRIG_PIN, HIGH); delayMicroseconds(10);
     digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
@@ -358,6 +381,9 @@ void openClawWithAttach() {
     clawServo.write(CLAW_OPEN_ANGLE);
     delay(500);
     clawServo.detach();
+    // Releasing an item re-arms the idle auto-grab so the next object can be
+    // picked up again.
+    itemGrabbed = false;
 }
 
 void gridSlightReverse() {
@@ -370,25 +396,45 @@ void gridSlightReverse() {
     gridStop();
 }
 
+// Slow-sweep close of the claw and latch the grabbed state. Shared by the
+// path-driven grabColor() and the idle auto-grab in loop().
+void closeClawGrip() {
+    clawServo.attach(CLAW_SERVO_PIN);
+
+    // SLOW SWEEP: Gradually close the claw instead of snapping it
+    for (int angle = CLAW_OPEN_ANGLE; angle <= CLAW_CLOSED_ANGLE; angle += 2) {
+        clawServo.write(angle);
+        delay(15); // Increase to 20 or 25 if it's STILL too fast
+    }
+
+    delay(800); // Wait almost a full second to ensure a firm grip before moving
+
+    clawServo.detach();
+
+    itemGrabbed = true;
+    disableSensors();
+}
+
 void grabColor(int color) {
     if (emergencyStopActive) return;
     int detected = gridDetectColorValue();
-    
+
     if (detected == color || color == ANY) {
-        clawServo.attach(CLAW_SERVO_PIN);
-        
-        // SLOW SWEEP: Gradually close the claw instead of snapping it
-        for (int angle = CLAW_OPEN_ANGLE; angle <= CLAW_CLOSED_ANGLE; angle += 2) {
-            clawServo.write(angle);
-            delay(15); // Increase to 20 or 25 if it's STILL too fast
-        }
-        
-        delay(800); // Wait almost a full second to ensure a firm grip before moving
+        closeClawGrip();
+    }
+}
 
-        clawServo.detach();
-
-        itemGrabbed = true;
-        disableSensors();
+// Idle auto-grab: while the robot is sitting still (not running a path), if an
+// object comes within GRAB_APPROACH_DISTANCE_CM, close the claw on it. Runs
+// only when nothing is already grabbed, sensors are enabled, and no e-stop.
+void idleAutoGrabCheck() {
+    if (itemGrabbed || !sensorsEnabled || emergencyStopActive) return;
+    int distance = gridGetDistanceCm();
+    if (distance > 0 && distance <= GRAB_APPROACH_DISTANCE_CM) {
+        Serial.print(F("[IDLE-GRAB] Object at "));
+        Serial.print(distance);
+        Serial.println(F("cm -> gripping."));
+        closeClawGrip();
     }
 }
 
@@ -405,10 +451,8 @@ void executeApproachMovement(int currentDistance) {
         if (checkEmergencyStop()) return;
         int color = gridDetectColorValue();
         int distance = gridGetDistanceCm();
-        if (debugTelemetry) {
-            Serial.print(F("[APPROACH] "));
-            printStatusTelemetry(distance, color);
-        }
+        Serial.print(F("[APPROACH] "));
+        printStatusTelemetry(distance, color);
         gridSetSpeed(approachSpeed);
         mecCar.Advance();
         delay(60);
@@ -718,6 +762,9 @@ void setup() {
 
 void loop() {
     handleSerialCommand();   // dashboard / USB debug control
+
+    // Idle auto-grab: grip anything that comes within range while sitting still
+    idleAutoGrabCheck();
 
     // Periodic automatic telemetry when enabled
     if (debugTelemetry && (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
