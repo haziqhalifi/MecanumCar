@@ -96,7 +96,7 @@ const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after
 #define GRIPPER_MOVE_DT        15    // ms between micro-steps (gentler current draw than a jump)
 
 #define ULTRASONIC_TIMEOUT_US  30000UL   // pulseIn timeout for the HC-SR04 echo
-#define APPROACH_STOP_DISTANCE_CM  6.0   // stop-and-grab distance (accounts for gripper reach); kept above the HC-SR04's ~2-5cm blind zone so a clean reading usually triggers the stop before echo loss does
+#define APPROACH_STOP_DISTANCE_CM  4.5   // stop-and-grab distance (accounts for gripper reach); sits inside the HC-SR04's ~2-5cm blind zone, so the no-echo-streak fallback below is what actually triggers most grabs
 #define APPROACH_SETTLE_MS     300       // pause after stopping / after grabbing
 #define APPROACH_TIMEOUT_MS    8000      // give up approaching if never in range this long
 #define NO_ECHO_STREAK_TO_GRAB 3         // consecutive no-echo reads (while approaching) before assuming "too close to read" and grabbing anyway
@@ -143,6 +143,9 @@ const int TARGET_BLOCKS_SEQ3 = 5;  // Button UP: forward blocks before and after
 #define TURN_CREEP_SPEED           40    // Slow speed used while centering on the target line
 #define TURN_CENTER_DEBOUNCE_MS    30    // How long MID must stay HIGH before accepting the center
 #define TURN_CENTER_TIMEOUT_MS     800   // Fallback: stop creeping after this long even if MID never centers
+
+#define ROTATE180_REVERSE_SPEED    50    // Speed while reversing between the two 90-degree turns of a 180
+#define ROTATE180_REVERSE_MS       200   // Duration of that reverse nudge
 
 // ── Turn Configuration ────────────────────────────────────────
 #define STOP_SENSOR_RIGHT_TURN  SENSOR_RIGHT
@@ -356,6 +359,17 @@ void sendTelemetry(const char* status, int blockCount) {
   espSerial.println(F("}"));
 }
 
+// Reports the ultrasonic's live block-detection reading, independent of
+// gripper state, so the dashboard always shows whether a block is in front
+// of the car right now (not just whether the last grab attempt happened).
+void sendBlockDetectionTelemetry(bool blockDetected) {
+  espSerial.print(F("{\"command\":\""));
+  espSerial.print(currentCommandName);
+  espSerial.print(F("\",\"block_detected\":"));
+  espSerial.print(blockDetected ? F("true") : F("false"));
+  espSerial.println(F("}"));
+}
+
 void reportEstop() {
   Serial.println(F("E-STOP!"));
   restoreIR();
@@ -442,8 +456,9 @@ void grabBlockInFront() {
 // needed. Scoped to "already close" rather than "detected at any range" so
 // the car doesn't autonomously drive across the room toward something it
 // merely sees; it only reacts to a block already right in front of it.
-// LIMITATION: there's currently no button wired to reopen the gripper, so
-// this only fires once per power-on until something manually re-opens it.
+// Fires once per grab: after closing on a block, gripperPosUs != GRIPPER_OPEN_US
+// suppresses further detection until the '#' button (CMD_HASH) reopens the
+// gripper via gripperMoveTo(GRIPPER_OPEN_US).
 void checkBackgroundGrab() {
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck < BACKGROUND_GRAB_CHECK_MS) return;
@@ -459,6 +474,8 @@ void checkBackgroundGrab() {
   if (distanceCm < 0) Serial.print(F("no echo")); else { Serial.print(distanceCm); Serial.print(F("cm")); }
   Serial.print(F(" -> block "));
   Serial.println(blockSeen ? F("DETECTED") : F("not detected"));
+
+  sendBlockDetectionTelemetry(blockSeen);
 
   if (gripperPosUs != GRIPPER_OPEN_US) return; // already holding something
 
@@ -575,7 +592,18 @@ bool rotateLeft90() {
 
 bool rotate180() {
   if (!rotateRight90()) return false;
-  delay(300);
+
+  unsigned long t_start = millis();
+  while (millis() - t_start < ROTATE180_REVERSE_MS) {
+    if (checkEstop()) {
+      reportEstop(); return false;
+    }
+    setMotorSpeed(ROTATE180_REVERSE_SPEED);
+    car.Back();
+  }
+  car.Stop();
+  delay(100);
+
   return rotateRight90();
 }
 
