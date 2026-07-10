@@ -378,8 +378,14 @@ const char *gridColorName(int color) {
 void openClawWithAttach() {
     if (emergencyStopActive) return;
     clawServo.attach(CLAW_SERVO_PIN);
-    clawServo.write(CLAW_OPEN_ANGLE);
-    delay(500);
+    // Re-send the open angle a few times with settle pauses in between. If the
+    // claw was gripping an object under stall current, a single write can be
+    // dropped by a momentary brownout — repeating it gives the servo more
+    // chances to actually reach the open position before we detach.
+    for (int i = 0; i < 3; i++) {
+        clawServo.write(CLAW_OPEN_ANGLE);
+        delay(400);
+    }
     clawServo.detach();
     // Releasing an item re-arms the idle auto-grab so the next object can be
     // picked up again.
@@ -442,9 +448,12 @@ bool isGrabTargetReached(int currentDistance) {
     return (currentDistance > 0 && currentDistance <= GRAB_APPROACH_DISTANCE_CM);
 }
 
-void executeApproachMovement(int currentDistance) {
+// startSpeed is the speed used while the object is still far off; the closer
+// currentDistance gets to the grab threshold, the more it's scaled down
+// (floored at SPEED_MIN) so the car visibly slows into the grip instead of
+// creeping at one constant speed the whole approach.
+void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
     if (emergencyStopActive) return;
-    uint8_t approachSpeed = (currentDistance <= 0) ? 25 : SPEED_MIN;
     unsigned long telemetryTickMillis = millis();
 
     while (!isGrabTargetReached(currentDistance)) {
@@ -453,6 +462,17 @@ void executeApproachMovement(int currentDistance) {
         int distance = gridGetDistanceCm();
         Serial.print(F("[APPROACH] "));
         printStatusTelemetry(distance, color);
+
+        uint8_t approachSpeed = startSpeed;
+        if (distance > 0) {
+            // Linearly ramp down from startSpeed at ITEM_DETECT_DISTANCE_CM
+            // down to SPEED_MIN at GRAB_APPROACH_DISTANCE_CM.
+            int span = ITEM_DETECT_DISTANCE_CM - GRAB_APPROACH_DISTANCE_CM;
+            int clamped = constrain(distance, GRAB_APPROACH_DISTANCE_CM, ITEM_DETECT_DISTANCE_CM);
+            int scaled = SPEED_MIN + (long)(startSpeed - SPEED_MIN) * (clamped - GRAB_APPROACH_DISTANCE_CM) / span;
+            approachSpeed = (uint8_t)constrain(scaled, SPEED_MIN, startSpeed);
+        }
+
         gridSetSpeed(approachSpeed);
         mecCar.Advance();
         delay(60);
@@ -513,10 +533,12 @@ void moveCoord(int targetX, int targetY) {
 
 // Approaches the nearest object with the ultrasonic sensor and grabs it if
 // its color matches targetColour (or always, if targetColour == ANY).
-void moveToGrab(int targetColour) {
+// approachStartSpeed lets callers (e.g. the UP button) creep in slower than
+// the scripted paths' default.
+void moveToGrab(int targetColour, uint8_t approachStartSpeed = SPEED_MIN) {
     if (checkEmergencyStop()) return;
     int distance = gridGetDistanceCm();
-    executeApproachMovement(distance);
+    executeApproachMovement(distance, approachStartSpeed);
     if (emergencyStopActive) return;
     grabColor(targetColour);
 }
@@ -808,6 +830,16 @@ void loop() {
                 // case 28: executeAutoMission(3, YELLOW); break;              // button 5
                 // case 90: executeAutoMission(5, YELLOW); break;              // button 6
                 case 74: openClawWithAttach(); break; // button #
+                case 70: // button UP — creep forward at 40, slowing further on approach, grip on contact
+                    sensorsEnabled = true;
+                    moveToGrab(ANY, 40);
+                    break;
+                case 64: // button OK — full reset: open grip, clear nav state, re-enable sensors
+                    openClawWithAttach();
+                    resetCoordinates();
+                    sensorsEnabled = true;
+                    Serial.println(F("[SYSTEM] OK pressed — reset complete."));
+                    break;
                 default: break;
             }
         }
