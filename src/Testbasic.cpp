@@ -35,8 +35,9 @@ const int RED = 0, BLUE = 1, YELLOW = 2, ANY = 3;
 bool itemGrabbed = false;
 bool sensorsEnabled = true;
 volatile bool emergencyStopActive = false; 
-// Enable/disable verbose sensor telemetry prints
-bool debugTelemetry = true;
+// Enable/disable verbose sensor telemetry prints (distance/color over serial).
+// Toggle at runtime with the serial "TELEMETRY"/"TEL" command.
+bool debugTelemetry = false;
 unsigned long lastTelemetryMillis = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 1000; // ms between automatic reports
 
@@ -47,14 +48,14 @@ int currentHeading = WEST;
 
 
 // ── Tuning Constants ───────────────────────────────────────────────────────
-const uint8_t SPEED_START_FAST = 60;
-const uint8_t SPEED_START_SLOW = 50;
-const uint8_t SPEED_MIN = 45;
+const uint8_t SPEED_START_FAST = 48;
+const uint8_t SPEED_START_SLOW = 42;
+const uint8_t SPEED_MIN = 38;
 // Extra speed added to a line-follow CORRECTION turn over the forward speed.
 // A bang-bang follower drives straight and yanks left/right to recover; at high
 // forward speed a same-speed correction is too weak, so the car weaves and can
 // sling off the line. Turning HARDER than it drives catches drift in one move.
-const uint8_t TURN_CORRECTION_BOOST = 12;
+const uint8_t TURN_CORRECTION_BOOST = 50;
 const unsigned long CENTER_OFFSET_MS = 110;
 const uint8_t SPEED_ROTATE = 60;
 // Blind-spin duration before we start hunting for the new perpendicular line.
@@ -72,9 +73,25 @@ const unsigned long TURN_BLIND_LEFT_MS  = 350;
 const unsigned long TURN_BLIND_RIGHT_MS = 350;
 const unsigned long BRAKE_MS = 55;
 const int ITEM_DETECT_DISTANCE_CM = 25;
-const int GRAB_APPROACH_DISTANCE_CM = 4;   // close the claw at <= 4cm
-const uint8_t CLAW_OPEN_ANGLE = 10;        // wider default-open (lower angle = more open)
+const int GRAB_APPROACH_DISTANCE_CM = 6;   // close the claw at <= 6cm (measured: this is where the block sits in the claw's reach)
+// Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
+// still used by the scripted paths' floor). Lets a caller start slower than
+// SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
+// further as it nears the grab distance.
+// NOTE: the speed value is sent straight through as raw PWM duty cycle to the
+// I2C motor driver (see mecanumCar::PWM_OUT / Writebyte) — there's no minimum
+// throttle mapping. 10/255 (~4%) is below the motors' stall/breakaway torque,
+// so the car just buzzed in place instead of creeping — that's why lowering
+// this earlier caused it to stop short of the block. Keep this close to
+// SPEED_MIN so it still physically moves; it only needs to be slightly below
+// SPEED_MIN to give a *visible* taper, not a true crawl.
+const uint8_t APPROACH_SPEED_FLOOR = 25;
+const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
+// Tracks the claw's last commanded angle so the LEFT/RIGHT arrow nudge
+// buttons can step from wherever it currently sits, rather than jumping to
+// an extreme. Kept in sync by openClawWithAttach()/closeClawGrip()/clawNudge().
+uint8_t clawCurrentAngle = CLAW_OPEN_ANGLE;
 const uint8_t SPEED_REVERSE_BUMP = 60; 
 const unsigned long REVERSE_BUMP_MS = 100; 
 const int CMD_STAR = 0x42; 
@@ -117,9 +134,28 @@ void motionTelemetryTick(unsigned long &lastTelemetryMillis) {
 }
 
 
-void gridSetSpeed(uint8_t targetSpeed) { 
+void gridSetSpeed(uint8_t targetSpeed) {
     speed_Upper_L = targetSpeed; speed_Lower_L = targetSpeed;
     speed_Upper_R = targetSpeed; speed_Lower_R = targetSpeed;
+}
+
+// Gentle line-follow correction: both sides keep driving FORWARD, but the
+// outer side runs faster than the inner side, arcing the car back onto the
+// line. This replaces using Turn_Left()/Turn_Right() as the correction, which
+// pivot the wheels in OPPOSITE directions (one side reverses) — a hard yank
+// that reads as jerky when it fires every sensor tick during a line-follow.
+// steerLeft=true arcs left (drifting back rightward), false arcs right.
+void gridSteer(uint8_t baseSpeed, uint8_t boost, bool steerLeft) {
+    uint8_t outer = (uint8_t)min(255, baseSpeed + boost);
+    uint8_t inner = baseSpeed;
+    if (steerLeft) {
+        speed_Upper_L = inner; speed_Lower_L = inner;
+        speed_Upper_R = outer; speed_Lower_R = outer;
+    } else {
+        speed_Upper_L = outer; speed_Lower_L = outer;
+        speed_Upper_R = inner; speed_Lower_R = inner;
+    }
+    mecCar.Advance();
 }
 
 void gridStop() {
@@ -229,15 +265,15 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         } else if (Left == LOW && Center == HIGH && Right == LOW) {
             onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
         } else if (Left == LOW && Center == LOW && Right == HIGH) {
-            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right();
+            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
         } else if (Left == HIGH && Center == LOW && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left();
+            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
+        } else if (Left == HIGH && Center == HIGH && Right == LOW) {
+            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
+        } else if (Left == LOW && Center == HIGH && Right == HIGH) {
+            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
         } else if (Left == LOW && Center == LOW && Right == LOW) {
             onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
-        } else if (Left == HIGH && Center == HIGH && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left();
-        } else if (Left == LOW && Center == HIGH && Right == HIGH) {
-            onJunction = false; gridSetSpeed(currentSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right();
         }
 
         motionTelemetryTick(telemetryTickMillis);
@@ -261,11 +297,10 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
-        gridSetSpeed(startSpeed);
-        if (Left == LOW && Center == HIGH && Right == LOW) mecCar.Advance();
-        else if (Right == HIGH) mecCar.Turn_Right();
-        else if (Left == HIGH) mecCar.Turn_Left();
-        else mecCar.Advance();
+        if (Left == LOW && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
+        else if (Right == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, false);
+        else if (Left == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, true);
+        else { gridSetSpeed(startSpeed); mecCar.Advance(); }
 
         motionTelemetryTick(telemetryTickMillis);
     }
@@ -279,11 +314,11 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         if (Left == HIGH && Center == HIGH && Right == HIGH) break;
         else if (Left == LOW && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
 
-        else if (Left == LOW && Center == LOW && Right == HIGH) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right(); }
-        else if (Left == HIGH && Center == LOW && Right == LOW) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left(); }
+        else if (Left == LOW && Center == LOW && Right == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, false);
+        else if (Left == HIGH && Center == LOW && Right == LOW) gridSteer(startSpeed, TURN_CORRECTION_BOOST, true);
         else if (Left == LOW && Center == LOW && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
-        else if (Left == HIGH && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Left(); }
-        else if (Left == LOW && Center == HIGH && Right == HIGH) { gridSetSpeed(startSpeed + TURN_CORRECTION_BOOST); mecCar.Turn_Right(); }
+        else if (Left == HIGH && Center == HIGH && Right == LOW) gridSteer(startSpeed, TURN_CORRECTION_BOOST, true);
+        else if (Left == LOW && Center == HIGH && Right == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, false);
 
         motionTelemetryTick(telemetryTickMillis);
     }
@@ -387,9 +422,28 @@ void openClawWithAttach() {
         delay(400);
     }
     clawServo.detach();
+    clawCurrentAngle = CLAW_OPEN_ANGLE;
     // Releasing an item re-arms the idle auto-grab so the next object can be
     // picked up again.
     itemGrabbed = false;
+}
+
+// Manual nudge for the LEFT/RIGHT arrow buttons: steps the claw a few degrees
+// toward open or closed from wherever it currently sits, instead of jumping
+// straight to the open/closed extreme.
+const uint8_t CLAW_NUDGE_STEP = 8;
+void clawNudge(bool towardClosed) {
+    if (emergencyStopActive) return;
+    int target = towardClosed ? clawCurrentAngle + CLAW_NUDGE_STEP
+                               : clawCurrentAngle - CLAW_NUDGE_STEP;
+    target = constrain(target, CLAW_OPEN_ANGLE, CLAW_CLOSED_ANGLE);
+    clawServo.attach(CLAW_SERVO_PIN);
+    clawServo.write(target);
+    delay(200);
+    clawServo.detach();
+    clawCurrentAngle = target;
+    Serial.print(F("[GRIPPER] Nudged to "));
+    Serial.println(clawCurrentAngle);
 }
 
 void gridSlightReverse() {
@@ -416,6 +470,7 @@ void closeClawGrip() {
     delay(800); // Wait almost a full second to ensure a firm grip before moving
 
     clawServo.detach();
+    clawCurrentAngle = CLAW_CLOSED_ANGLE;
 
     itemGrabbed = true;
     disableSensors();
@@ -450,27 +505,33 @@ bool isGrabTargetReached(int currentDistance) {
 
 // startSpeed is the speed used while the object is still far off; the closer
 // currentDistance gets to the grab threshold, the more it's scaled down
-// (floored at SPEED_MIN) so the car visibly slows into the grip instead of
-// creeping at one constant speed the whole approach.
+// toward the floor so the car visibly slows into the grip instead of
+// creeping at one constant speed the whole approach. Paths that pass
+// SPEED_MIN (their original default) keep SPEED_MIN as the floor, unchanged.
+// A caller starting below SPEED_MIN (e.g. the UP button's 40) instead floors
+// at APPROACH_SPEED_FLOOR, so it still has real room to taper down further.
 void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
     if (emergencyStopActive) return;
     unsigned long telemetryTickMillis = millis();
+    uint8_t floorSpeed = (startSpeed < SPEED_MIN) ? min(APPROACH_SPEED_FLOOR, startSpeed) : SPEED_MIN;
 
     while (!isGrabTargetReached(currentDistance)) {
         if (checkEmergencyStop()) return;
         int color = gridDetectColorValue();
         int distance = gridGetDistanceCm();
-        Serial.print(F("[APPROACH] "));
-        printStatusTelemetry(distance, color);
+        if (debugTelemetry) {
+            Serial.print(F("[APPROACH] "));
+            printStatusTelemetry(distance, color);
+        }
 
         uint8_t approachSpeed = startSpeed;
         if (distance > 0) {
             // Linearly ramp down from startSpeed at ITEM_DETECT_DISTANCE_CM
-            // down to SPEED_MIN at GRAB_APPROACH_DISTANCE_CM.
+            // down to floorSpeed at GRAB_APPROACH_DISTANCE_CM.
             int span = ITEM_DETECT_DISTANCE_CM - GRAB_APPROACH_DISTANCE_CM;
             int clamped = constrain(distance, GRAB_APPROACH_DISTANCE_CM, ITEM_DETECT_DISTANCE_CM);
-            int scaled = SPEED_MIN + (long)(startSpeed - SPEED_MIN) * (clamped - GRAB_APPROACH_DISTANCE_CM) / span;
-            approachSpeed = (uint8_t)constrain(scaled, SPEED_MIN, startSpeed);
+            int scaled = floorSpeed + (long)(startSpeed - floorSpeed) * (clamped - GRAB_APPROACH_DISTANCE_CM) / span;
+            approachSpeed = (uint8_t)constrain(scaled, floorSpeed, startSpeed);
         }
 
         gridSetSpeed(approachSpeed);
@@ -616,6 +677,7 @@ const Step path3[] = {
 // Add 'int targetColour' to the parameters
 void runPath(const Step* path, int len, int targetColour) {
     sensorsEnabled = true;
+    openClawWithAttach();   // ensure the gripper starts open before any sequence runs
     for (int i = 0; i < len; i++) {
         if (emergencyStopActive) break;
         switch(path[i].act) {
@@ -834,6 +896,8 @@ void loop() {
                     sensorsEnabled = true;
                     moveToGrab(ANY, 40);
                     break;
+                case 67: clawNudge(false); break; // button RIGHT — nudge claw toward OPEN
+                case 68: clawNudge(true);  break; // button LEFT  — nudge claw toward CLOSED
                 case 64: // button OK — full reset: open grip, clear nav state, re-enable sensors
                     openClawWithAttach();
                     resetCoordinates();
