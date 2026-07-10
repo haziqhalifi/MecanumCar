@@ -33,7 +33,10 @@ Servo clawServo;
 const int RED = 0, BLUE = 1, YELLOW = 2, ANY = 3;
 
 bool itemGrabbed = false;
-bool sensorsEnabled = true;
+// Sensors (ultrasonic + color) start OFF so nothing pings the ultrasonic while
+// idle. runPath()/moveToGrab() enable them only for the approach-and-grab, and
+// the UP button enables them for its manual grab.
+bool sensorsEnabled = false;
 volatile bool emergencyStopActive = false; 
 // Enable/disable verbose sensor telemetry prints (distance/color over serial).
 // Toggle at runtime with the serial "TELEMETRY"/"TEL" command.
@@ -51,11 +54,21 @@ int currentHeading = WEST;
 const uint8_t SPEED_START_FAST = 48;
 const uint8_t SPEED_START_SLOW = 42;
 const uint8_t SPEED_MIN = 38;
+// Crawl speed for the final block of a forward move (last grid before stopping),
+// so the car eases onto the last junction and stops right on it. Kept just
+// above the motor stall floor so it still moves but is clearly slower than the
+// SPEED_MIN=38 the earlier blocks ramp down to.
+const uint8_t FINAL_BLOCK_CRAWL_SPEED = 35;
 // Extra speed added to a line-follow CORRECTION turn over the forward speed.
 // A bang-bang follower drives straight and yanks left/right to recover; at high
 // forward speed a same-speed correction is too weak, so the car weaves and can
 // sling off the line. Turning HARDER than it drives catches drift in one move.
 const uint8_t TURN_CORRECTION_BOOST = 50;
+// Gentler correction used only during the final block approach. The full
+// TURN_CORRECTION_BOOST yanks the car sideways hunting the line, which throws
+// off its alignment with the block so it can't grab. A small boost just keeps
+// it roughly straight toward the block instead of aggressively arcing.
+const uint8_t APPROACH_CORRECTION_BOOST = 12;
 const unsigned long CENTER_OFFSET_MS = 110;
 const uint8_t SPEED_ROTATE = 60;
 // Blind-spin duration before we start hunting for the new perpendicular line.
@@ -72,8 +85,20 @@ const uint8_t SPEED_ROTATE = 60;
 const unsigned long TURN_BLIND_LEFT_MS  = 350;
 const unsigned long TURN_BLIND_RIGHT_MS = 350;
 const unsigned long BRAKE_MS = 55;
+// Pause after a 90-degree turn completes, letting the chassis fully settle
+// before the next move.
+const unsigned long TURN_SETTLE_MS = 600;
+// Pause before the claw closes (let the car come to a full stop) and after it
+// closes (let the grip firm up before the robot moves the item).
+const unsigned long GRAB_SETTLE_MS = 500;
+// Settling pause inserted between each step of a scripted path so transitions
+// aren't abrupt.
+const unsigned long STEP_TRANSITION_MS = 250;
+// Start speed for the scripted-path block approach. Kept below SPEED_MIN so the
+// approach creeps in noticeably slower and still tapers toward APPROACH_SPEED_FLOOR.
+const uint8_t PATH_APPROACH_SPEED = 42;
 const int ITEM_DETECT_DISTANCE_CM = 25;
-const int GRAB_APPROACH_DISTANCE_CM = 6;   // close the claw at <= 6cm (measured: this is where the block sits in the claw's reach)
+const int GRAB_APPROACH_DISTANCE_CM = 6;   // close the claw at <= 6cm (measured: where the block sits in the claw's reach)
 // Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
 // still used by the scripted paths' floor). Lets a caller start slower than
 // SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
@@ -85,9 +110,11 @@ const int GRAB_APPROACH_DISTANCE_CM = 6;   // close the claw at <= 6cm (measured
 // this earlier caused it to stop short of the block. Keep this close to
 // SPEED_MIN so it still physically moves; it only needs to be slightly below
 // SPEED_MIN to give a *visible* taper, not a true crawl.
-const uint8_t APPROACH_SPEED_FLOOR = 25;
+const uint8_t APPROACH_SPEED_FLOOR = 38;
 const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
+// pulseIn timeout for one color-sensor channel read (microseconds).
+const unsigned long COLOR_PULSE_TIMEOUT_US = 30000UL;
 // Tracks the claw's last commanded angle so the LEFT/RIGHT arrow nudge
 // buttons can step from wherever it currently sits, rather than jumping to
 // an extreme. Kept in sync by openClawWithAttach()/closeClawGrip()/clawNudge().
@@ -209,7 +236,7 @@ bool gridRotateLeft90() {
     
     unsigned long settleStart = millis();
 
-    while (millis() - settleStart < 300) { if (checkEmergencyStop()) return false; }
+    while (millis() - settleStart < TURN_SETTLE_MS) { if (checkEmergencyStop()) return false; }
     return true;
 }
 
@@ -234,7 +261,7 @@ bool gridRotateRight90() {
     mecCar.Stop();
     
     unsigned long settleStart = millis();
-    while (millis() - settleStart < 300) { if (checkEmergencyStop()) return false; }
+    while (millis() - settleStart < TURN_SETTLE_MS) { if (checkEmergencyStop()) return false; }
     return true;
 }
 
@@ -252,6 +279,10 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
 
         int calculatedSpeed = startSpeed - (junctionCount * 5);
         if (calculatedSpeed < SPEED_MIN) calculatedSpeed = SPEED_MIN;
+        // On the final block (heading toward the last target junction), crawl
+        // slower so the car approaches the last grid gently and stops right on
+        // it instead of coasting past.
+        if (junctionCount == targetBlocks - 1) calculatedSpeed = FINAL_BLOCK_CRAWL_SPEED;
         uint8_t currentSpeed = (uint8_t)calculatedSpeed;
 
         if (Left == HIGH && Center == HIGH && Right == HIGH) {
@@ -374,13 +405,30 @@ bool checkItem() {
     return (distance > 0 && distance <= ITEM_DETECT_DISTANCE_CM);
 }
 
+// Reads one color channel, averaged over several samples for stability.
+// A pulseIn timeout returns 0; we map that to the max timeout value so a
+// dropped reading counts as "very little of this color" (largest pulse width)
+// instead of falsely winning the "smallest = this color" comparison.
 unsigned long gridReadColorChannel(bool s2, bool s3) {
-    if (emergencyStopActive) return 0;
+    if (emergencyStopActive) return COLOR_PULSE_TIMEOUT_US;
     digitalWrite(COLOR_S2_PIN, s2 ? HIGH : LOW);
     digitalWrite(COLOR_S3_PIN, s3 ? HIGH : LOW);
-    delay(10);
-    return pulseIn(COLOR_OUT_PIN, LOW, 30000UL);
+    delay(10); // let the sensor's filter settle after switching channels
+
+    const int COLOR_SAMPLES = 3;
+    unsigned long total = 0;
+    for (int i = 0; i < COLOR_SAMPLES; i++) {
+        unsigned long p = pulseIn(COLOR_OUT_PIN, LOW, COLOR_PULSE_TIMEOUT_US);
+        if (p == 0) p = COLOR_PULSE_TIMEOUT_US; // timeout -> treat as max, not min
+        total += p;
+    }
+    return total / COLOR_SAMPLES;
 }
+
+// When true, gridDetectColorValue() prints its raw R/G/B pulse values on every
+// read regardless of debugTelemetry. Turned on around the grab decision so the
+// actual numbers are visible for tuning without enabling full telemetry spam.
+bool logColorRaw = false;
 
 int gridDetectColorValue() {
     if (!sensorsEnabled || emergencyStopActive) return ANY;
@@ -393,7 +441,7 @@ int gridDetectColorValue() {
     else if (red < blue && green < blue && red < green * 1.4 && green < red * 1.4) result = YELLOW;
     else if (red < green && red < blue) result = RED;
 
-    if (debugTelemetry) {
+    if (debugTelemetry || logColorRaw) {
         Serial.print(F("[DBG] Color raw R=")); Serial.print(red);
         Serial.print(F(" G=")); Serial.print(green);
         Serial.print(F(" B=")); Serial.print(blue);
@@ -401,6 +449,24 @@ int gridDetectColorValue() {
         Serial.println(gridColorName(result));
     }
     return result;
+}
+
+// Reads the color several times and returns the most common result — a single
+// noisy sample can't flip the decision. Used at grab time where a wrong read
+// means the wrong block (or no) grab.
+int gridDetectColorMajority() {
+    int votes[4] = {0, 0, 0, 0}; // RED, BLUE, YELLOW, ANY
+    const int COLOR_VOTES = 5;
+    for (int i = 0; i < COLOR_VOTES; i++) {
+        int c = gridDetectColorValue();
+        if (c >= 0 && c <= ANY) votes[c]++;
+    }
+    // Pick the most-voted concrete color; ANY only wins if nothing else did.
+    int best = ANY, bestCount = votes[ANY];
+    for (int c = RED; c <= YELLOW; c++) {
+        if (votes[c] > bestCount) { best = c; bestCount = votes[c]; }
+    }
+    return best;
 }
 
 const char *gridColorName(int color) {
@@ -459,6 +525,8 @@ void gridSlightReverse() {
 // Slow-sweep close of the claw and latch the grabbed state. Shared by the
 // path-driven grabColor() and the idle auto-grab in loop().
 void closeClawGrip() {
+    delay(GRAB_SETTLE_MS); // let the car come to a full stop before gripping
+
     clawServo.attach(CLAW_SERVO_PIN);
 
     // SLOW SWEEP: Gradually close the claw instead of snapping it
@@ -474,28 +542,25 @@ void closeClawGrip() {
 
     itemGrabbed = true;
     disableSensors();
+
+    delay(GRAB_SETTLE_MS); // let the grip firm up before the robot moves the item
 }
 
 void grabColor(int color) {
     if (emergencyStopActive) return;
-    int detected = gridDetectColorValue();
+    logColorRaw = true;                    // show raw R/G/B for each vote read
+    int detected = gridDetectColorMajority();
+    logColorRaw = false;
+
+    Serial.print(F("[GRAB] target="));
+    Serial.print(gridColorName(color));
+    Serial.print(F(" detected="));
+    Serial.println(gridColorName(detected));
 
     if (detected == color || color == ANY) {
         closeClawGrip();
-    }
-}
-
-// Idle auto-grab: while the robot is sitting still (not running a path), if an
-// object comes within GRAB_APPROACH_DISTANCE_CM, close the claw on it. Runs
-// only when nothing is already grabbed, sensors are enabled, and no e-stop.
-void idleAutoGrabCheck() {
-    if (itemGrabbed || !sensorsEnabled || emergencyStopActive) return;
-    int distance = gridGetDistanceCm();
-    if (distance > 0 && distance <= GRAB_APPROACH_DISTANCE_CM) {
-        Serial.print(F("[IDLE-GRAB] Object at "));
-        Serial.print(distance);
-        Serial.println(F("cm -> gripping."));
-        closeClawGrip();
+    } else {
+        Serial.println(F("[GRAB] Color mismatch — skipping grip."));
     }
 }
 
@@ -534,8 +599,25 @@ void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
             approachSpeed = (uint8_t)constrain(scaled, floorSpeed, startSpeed);
         }
 
-        gridSetSpeed(approachSpeed);
-        mecCar.Advance();
+        // Stay centered on the line while creeping toward the block — same
+        // correction branches as the line-follow functions. Without this the
+        // approach drove straight blind and could drift off track over the
+        // (up to ITEM_DETECT_DISTANCE_CM) approach distance.
+        uint8_t Left = digitalRead(LINE_LEFT_PIN);
+        uint8_t Center = digitalRead(LINE_CENTER_PIN);
+        uint8_t Right = digitalRead(LINE_RIGHT_PIN);
+        if (Left == LOW && Center == LOW && Right == HIGH) {
+            gridSteer(approachSpeed, APPROACH_CORRECTION_BOOST, false);
+        } else if (Left == HIGH && Center == LOW && Right == LOW) {
+            gridSteer(approachSpeed, APPROACH_CORRECTION_BOOST, true);
+        } else if (Left == HIGH && Center == HIGH && Right == LOW) {
+            gridSteer(approachSpeed, APPROACH_CORRECTION_BOOST, true);
+        } else if (Left == LOW && Center == HIGH && Right == HIGH) {
+            gridSteer(approachSpeed, APPROACH_CORRECTION_BOOST, false);
+        } else {
+            gridSetSpeed(approachSpeed);
+            mecCar.Advance();
+        }
         delay(60);
         currentDistance = gridGetDistanceCm();
         motionTelemetryTick(telemetryTickMillis);
@@ -674,23 +756,43 @@ const Step path3[] = {
     {REV, 2}
 };
 
+// Returns true if the next non-DLY step at or after index `from` is a GRB.
+// Used to enable the ultrasonic/color sensors only for the final forward that
+// approaches the block, keeping them off during all other navigation.
+static bool nextRealStepIsGrab(const Step* path, int len, int from) {
+    for (int j = from; j < len; j++) {
+        if (path[j].act == DLY) continue;
+        return path[j].act == GRB;
+    }
+    return false;
+}
+
 // Add 'int targetColour' to the parameters
 void runPath(const Step* path, int len, int targetColour) {
-    sensorsEnabled = true;
+    // Sensors (ultrasonic + color) stay OFF during navigation and only turn on
+    // for the last forward that approaches the block (the FWD immediately
+    // before a GRB) and the GRB itself.
+    sensorsEnabled = false;
     openClawWithAttach();   // ensure the gripper starts open before any sequence runs
     for (int i = 0; i < len; i++) {
         if (emergencyStopActive) break;
         switch(path[i].act) {
-            case FWD: gridMoveForwardBlocks(path[i].arg, SPEED_START_FAST); break;
-            case LFT: gridRotateLeft90(); break;
-            case RGT: gridRotateRight90(); break;
-            case GRB: moveToGrab(targetColour); break; // Use targetColour here
+            case FWD:
+                // Enable sensors if this forward leads straight into a grab.
+                sensorsEnabled = nextRealStepIsGrab(path, len, i + 1);
+                gridMoveForwardBlocks(path[i].arg, SPEED_START_FAST);
+                break;
+            case LFT: sensorsEnabled = false; gridRotateLeft90(); break;
+            case RGT: sensorsEnabled = false; gridRotateRight90(); break;
+            case GRB: sensorsEnabled = true; moveToGrab(targetColour, PATH_APPROACH_SPEED); break;
             case REV: gridSlightReverse(); break;
             case DRP: openClawWithAttach(); break;
 
             case GDR: goToDrop(); break;
             case DLY: delay(path[i].arg * 100); break;
         }
+        // Brief settling pause between steps so transitions aren't abrupt.
+        if (!emergencyStopActive) delay(STEP_TRANSITION_MS);
     }
 }
 
@@ -846,9 +948,6 @@ void setup() {
 
 void loop() {
     handleSerialCommand();   // dashboard / USB debug control
-
-    // Idle auto-grab: grip anything that comes within range while sitting still
-    idleAutoGrabCheck();
 
     // Periodic automatic telemetry when enabled
     if (debugTelemetry && (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
