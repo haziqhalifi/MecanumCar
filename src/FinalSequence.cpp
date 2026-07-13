@@ -2,6 +2,38 @@
 #include <Servo.h>
 #include "MecanumCar_v2.h"
 #include <IRremote.hpp>
+#include <SoftwareSerial.h>
+
+// ── ESP32 wireless bridge link ───────────────────────────────────────────────
+// A SoftwareSerial link to the ESP32 web-dashboard bridge, kept OFF the Uno's
+// hardware Serial (pins 0/1) so the USB Serial Monitor stays usable for
+// debugging while the ESP32 talks to the Uno independently.
+//   SoftwareSerial(RX, TX) = (11, 10)  — matches lib/main.cpp's convention:
+//     Uno pin 11 (RX) <- ESP32 TX2 (GPIO17)
+//     Uno pin 10 (TX) -> ESP32 RX2 (GPIO16)   [level-shift 5V->3.3V]
+//   Common GND. Runs at 9600 to match Serial.
+SoftwareSerial espSerial(11, 10);
+
+// Tee Print target: everything written to Bridge goes to BOTH the USB Serial
+// (so the wired Serial Monitor still shows it) and espSerial (so the wireless
+// dashboard sees the same telemetry/log lines). All the firmware's telemetry
+// and [ACK]/[TURN]/[NAVIGATE]/... log lines print through this, so both the USB
+// and wireless dashboards receive identical output. Command *input* is read
+// from whichever of the two links has bytes (see handleSerialCommand()).
+class BridgePrint : public Print {
+public:
+    size_t write(uint8_t c) override {
+        Serial.write(c);
+        espSerial.write(c);
+        return 1;
+    }
+    size_t write(const uint8_t *buffer, size_t size) override {
+        Serial.write(buffer, size);
+        espSerial.write(buffer, size);
+        return size;
+    }
+};
+BridgePrint Bridge;
 
 // ── Line Tracking Sensors Pin Definitions ──────────────────────────────────
 #define LINE_LEFT_PIN A0
@@ -132,11 +164,11 @@ bool checkEmergencyStop();
 
 void printStatusTelemetry(int distance, int color) {
     if (emergencyStopActive) return;
-    Serial.print(F("distance: "));
-    if (distance == -1) Serial.print(F("---"));
-    else Serial.print(distance);
-    Serial.print(F("cm | color: "));
-    Serial.println(gridColorName(color));
+    Bridge.print(F("distance: "));
+    if (distance == -1) Bridge.print(F("---"));
+    else Bridge.print(distance);
+    Bridge.print(F("cm | color: "));
+    Bridge.println(gridColorName(color));
 }
 
 // Read sensors and print a single consolidated telemetry line without
@@ -149,7 +181,7 @@ void telemetryReport() {
     int color = gridDetectColorValue();
     debugTelemetry = prevDebug;
 
-    Serial.print(F("[AUTO] "));
+    Bridge.print(F("[AUTO] "));
     printStatusTelemetry(distance, color);
 }
 
@@ -187,7 +219,7 @@ void gridSteer(uint8_t baseSpeed, uint8_t boost, bool steerLeft) {
 
 void gridStop() {
     mecCar.Stop();
-    Serial.println(F("[SYSTEM] Robot Halted."));
+    Bridge.println(F("[SYSTEM] Robot Halted."));
 }
 
 void spinRightInPlace(uint8_t speed) { gridSetSpeed(speed); mecCar.Turn_Right(); }
@@ -195,7 +227,24 @@ void spinLeftInPlace(uint8_t speed) { gridSetSpeed(speed); mecCar.Turn_Left(); }
 
 void disableSensors() {
     sensorsEnabled = false;
-    Serial.println(F("[SYSTEM] Ultrasonic and Color sensors have been SOFTWARE DISABLED."));
+    Bridge.println(F("[SYSTEM] Ultrasonic and Color sensors have been SOFTWARE DISABLED."));
+}
+
+// Peek at either serial link for a dashboard STOP without consuming a full
+// command line. Called from inside long-running motion loops so a STOP sent
+// while the car is mid-move (dashboard or wired) aborts immediately, just like
+// the IR remote — instead of waiting for the whole move to finish. We look at
+// the first byte only ('S'): the ESP32 forwards "STOP\n" verbatim, and no other
+// command the dashboard sends starts with 'S' except SENSORS, which is refused
+// while latched anyway. On a match we drain the rest of the line so it doesn't
+// linger in the buffer.
+bool serialStopRequested(Stream &link) {
+    if (!link.available()) return false;
+    if (link.peek() != 'S' && link.peek() != 's') return false;
+    String line = link.readStringUntil('\n');
+    line.trim();
+    line.toUpperCase();
+    return line == "STOP";
 }
 
 bool checkEmergencyStop() {
@@ -203,18 +252,25 @@ bool checkEmergencyStop() {
         if (IrReceiver.decodedIRData.command == CMD_STAR) {
             emergencyStopActive = true;
             gridStop();
-            Serial.println(F("\n!!! EMERGENCY STOP TRIGGERED !!!"));
+            Bridge.println(F("\n!!! EMERGENCY STOP TRIGGERED !!!"));
             IrReceiver.resume();
             return true;
         }
         IrReceiver.resume();
+    }
+    // Dashboard / wired STOP mid-move: abort just as hard as the IR remote.
+    if (serialStopRequested(Serial) || serialStopRequested(espSerial)) {
+        emergencyStopActive = true;
+        gridStop();
+        Bridge.println(F("\n!!! EMERGENCY STOP TRIGGERED (dashboard) !!!"));
+        return true;
     }
     return emergencyStopActive;
 }
 
 bool gridRotateLeft90() {
     if (checkEmergencyStop()) return false;
-    Serial.println(F("\n[TURN] Symmetrical Spin 90 Degrees Left..."));
+    Bridge.println(F("\n[TURN] Symmetrical Spin 90 Degrees Left..."));
     // NOTE: no telemetry reads inside the spin loops — the ultrasonic/color
     // pulseIn calls block for tens of ms and make the turn angle inconsistent.
     unsigned long startTime = millis();
@@ -242,7 +298,7 @@ bool gridRotateLeft90() {
 
 bool gridRotateRight90() {
     if (checkEmergencyStop()) return false;
-    Serial.println(F("\n[TURN] Symmetrical Spin 90 Degrees Right..."));
+    Bridge.println(F("\n[TURN] Symmetrical Spin 90 Degrees Right..."));
     // NOTE: no telemetry reads inside the spin loops — the ultrasonic/color
     // pulseIn calls block for tens of ms and make the turn angle inconsistent.
     unsigned long startTime = millis();
@@ -379,20 +435,20 @@ int gridGetDistanceCm() {
     unsigned long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000UL);
     if (duration == 0) {
         if (debugTelemetry) {
-            Serial.print(F("[DBG] Distance: --- (out of range) rawDuration="));
-            Serial.print(duration);
-            Serial.print(F(" echo="));
-            Serial.println(digitalRead(ULTRASONIC_ECHO_PIN));
+            Bridge.print(F("[DBG] Distance: --- (out of range) rawDuration="));
+            Bridge.print(duration);
+            Bridge.print(F(" echo="));
+            Bridge.println(digitalRead(ULTRASONIC_ECHO_PIN));
         }
         return -1;
     }
     int dist = (int)(duration / 58.2);
     if (debugTelemetry) {
-        Serial.print(F("[DBG] Distance: "));
-        Serial.print(dist);
-        Serial.print(F(" cm (duration="));
-        Serial.print(duration);
-        Serial.println(F(")"));
+        Bridge.print(F("[DBG] Distance: "));
+        Bridge.print(dist);
+        Bridge.print(F(" cm (duration="));
+        Bridge.print(duration);
+        Bridge.println(F(")"));
     }
     return dist;
 }
@@ -442,11 +498,11 @@ int gridDetectColorValue() {
     else if (red < green && red < blue) result = RED;
 
     if (debugTelemetry || logColorRaw) {
-        Serial.print(F("[DBG] Color raw R=")); Serial.print(red);
-        Serial.print(F(" G=")); Serial.print(green);
-        Serial.print(F(" B=")); Serial.print(blue);
-        Serial.print(F(" -> "));
-        Serial.println(gridColorName(result));
+        Bridge.print(F("[DBG] Color raw R=")); Bridge.print(red);
+        Bridge.print(F(" G=")); Bridge.print(green);
+        Bridge.print(F(" B=")); Bridge.print(blue);
+        Bridge.print(F(" -> "));
+        Bridge.println(gridColorName(result));
     }
     return result;
 }
@@ -508,13 +564,13 @@ void clawNudge(bool towardClosed) {
     delay(200);
     clawServo.detach();
     clawCurrentAngle = target;
-    Serial.print(F("[GRIPPER] Nudged to "));
-    Serial.println(clawCurrentAngle);
+    Bridge.print(F("[GRIPPER] Nudged to "));
+    Bridge.println(clawCurrentAngle);
 }
 
 void gridSlightReverse() {
     if (checkEmergencyStop()) return;
-    Serial.println(F("[TRACK] Execution of brief post-turn alignment reverse..."));
+    Bridge.println(F("[TRACK] Execution of brief post-turn alignment reverse..."));
     gridSetSpeed(SPEED_REVERSE_BUMP);
     mecCar.Back();
     unsigned long startTime = millis();
@@ -546,22 +602,32 @@ void closeClawGrip() {
     delay(GRAB_SETTLE_MS); // let the grip firm up before the robot moves the item
 }
 
-void grabColor(int color) {
-    if (emergencyStopActive) return;
+// Reads the block color (majority vote) and grips ONLY if it matches `color`
+// (or `color == ANY`). Returns true if the claw actually closed on the block,
+// false on a color mismatch (claw left open, car untouched). Callers use the
+// return value to decide whether to keep searching the other blocks.
+bool grabColorIfMatch(int color) {
+    if (emergencyStopActive) return false;
     logColorRaw = true;                    // show raw R/G/B for each vote read
     int detected = gridDetectColorMajority();
     logColorRaw = false;
 
-    Serial.print(F("[GRAB] target="));
-    Serial.print(gridColorName(color));
-    Serial.print(F(" detected="));
-    Serial.println(gridColorName(detected));
+    Bridge.print(F("[GRAB] target="));
+    Bridge.print(gridColorName(color));
+    Bridge.print(F(" detected="));
+    Bridge.println(gridColorName(detected));
 
     if (detected == color || color == ANY) {
         closeClawGrip();
-    } else {
-        Serial.println(F("[GRAB] Color mismatch — skipping grip."));
+        return true;
     }
+    Bridge.println(F("[GRAB] Color mismatch — skipping grip."));
+    return false;
+}
+
+// Backward-compatible wrapper: grips on match, ignores the result.
+void grabColor(int color) {
+    grabColorIfMatch(color);
 }
 
 bool isGrabTargetReached(int currentDistance) {
@@ -585,7 +651,7 @@ void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
         int color = gridDetectColorValue();
         int distance = gridGetDistanceCm();
         if (debugTelemetry) {
-            Serial.print(F("[APPROACH] "));
+            Bridge.print(F("[APPROACH] "));
             printStatusTelemetry(distance, color);
         }
 
@@ -669,7 +735,7 @@ void moveCoord(int targetX, int targetY) {
         }
     }
 
-    Serial.println(F("[NAVIGATE] Target Node Reached. Aligning to WEST baseline..."));
+    Bridge.println(F("[NAVIGATE] Target Node Reached. Aligning to WEST baseline..."));
     turnToHeading(WEST);
     gridStop();
 }
@@ -678,19 +744,20 @@ void moveCoord(int targetX, int targetY) {
 // its color matches targetColour (or always, if targetColour == ANY).
 // approachStartSpeed lets callers (e.g. the UP button) creep in slower than
 // the scripted paths' default.
-void moveToGrab(int targetColour, uint8_t approachStartSpeed = SPEED_MIN) {
-    if (checkEmergencyStop()) return;
+// Returns true if a block of the target colour was actually grabbed.
+bool moveToGrab(int targetColour, uint8_t approachStartSpeed = SPEED_MIN) {
+    if (checkEmergencyStop()) return false;
     int distance = gridGetDistanceCm();
     executeApproachMovement(distance, approachStartSpeed);
-    if (emergencyStopActive) return;
-    grabColor(targetColour);
+    if (emergencyStopActive) return false;
+    return grabColorIfMatch(targetColour);
 }
 
 void moveHome() {
     if (checkEmergencyStop()) return;
     moveCoord(4, 3); // Leveraging existing moveCoord instead of repeating logic
     if (emergencyStopActive) return;
-    Serial.println(F("[NAVIGATE] Home Node Reached. Aligning to EAST baseline..."));
+    Bridge.println(F("[NAVIGATE] Home Node Reached. Aligning to EAST baseline..."));
     turnToHeading(EAST);
     gridStop();
 }
@@ -723,13 +790,142 @@ void goToDrop() {
         } else { mecCar.Advance(); }
     }
     mecCar.Stop();
-    if (!emergencyStopActive) Serial.println(F("[SYSTEM] Drop zone reached. Stopped instantly."));
+    if (!emergencyStopActive) Bridge.println(F("[SYSTEM] Drop zone reached. Stopped instantly."));
 }
 
 void resetCoordinates() {
     currentX = 4; currentY = 3; currentHeading = WEST;
-    emergencyStopActive = false; 
-    Serial.println(F("[SYSTEM] Navigation Tracker Reset to Default Home Baseline (4,3) facing WEST."));
+    emergencyStopActive = false;
+    Bridge.println(F("[SYSTEM] Navigation Tracker Reset to Default Home Baseline (4,3) facing WEST."));
+}
+
+// ── Color-search across the 3 blocks ─────────────────────────────────────────
+// The three blocks sit in a vertical line at grid column X=0, rows Y=1/3/5,
+// each approached facing WEST. The robot navigates on the grid node one column
+// east of each block (X=1) and lets moveToGrab() creep the final stretch WEST
+// onto the block to read its colour and grip.
+//
+// On a colour mismatch it reverses off the block and hops to the nearest
+// unchecked block (rows are 2 apart), re-approaches, and re-reads — repeating
+// until the target colour is grabbed or all three blocks are exhausted. If none
+// match, it drives home and stops (no grab).
+//
+// Returns the block row (1/3/5) that was grabbed, or -1 if none matched.
+const int BLOCK_ROWS[3] = {1, 3, 5};
+const uint8_t SEARCH_APPROACH_SPEED = PATH_APPROACH_SPEED;
+
+// Backs the car off the block until it re-acquires the grid node (all three
+// line sensors on the junction cross = all HIGH), so the coordinate-tracked
+// navigation to the next block starts from a known node. The grab approach
+// crept WEST off the node onto the block, so a fixed slight-reverse isn't
+// enough to guarantee we're back on the junction — reverse until we see it.
+static void backOffBlock() {
+    if (checkEmergencyStop()) return;
+    Bridge.println(F("[SEARCH] Reversing off block to re-acquire grid node..."));
+    gridSetSpeed(SPEED_REVERSE_BUMP);
+    mecCar.Back();
+    // Cap the reverse so a missed junction can't run the car off the mat.
+    unsigned long startTime = millis();
+    const unsigned long BACKOFF_TIMEOUT_MS = 2500;
+    while (millis() - startTime < BACKOFF_TIMEOUT_MS) {
+        if (checkEmergencyStop()) return;
+        if (digitalRead(LINE_LEFT_PIN) == HIGH &&
+            digitalRead(LINE_CENTER_PIN) == HIGH &&
+            digitalRead(LINE_RIGHT_PIN) == HIGH) {
+            break; // back on the junction
+        }
+    }
+    gridStop();
+    if (!emergencyStopActive) delay(STEP_TRANSITION_MS);
+}
+
+int searchAndGrab(int targetColour, int startRow) {
+    // Visit order: start block first, then remaining blocks nearest-first by
+    // row distance from the current block.
+    int order[3];
+    order[0] = startRow;
+    int n = 1;
+    // Fill the rest sorted by |row - previousRow| so each hop is to the closest
+    // unchecked block.
+    bool used[3] = {false, false, false};
+    for (int i = 0; i < 3; i++) if (BLOCK_ROWS[i] == startRow) used[i] = true;
+    int fromRow = startRow;
+    while (n < 3) {
+        int bestIdx = -1, bestDist = 999;
+        for (int i = 0; i < 3; i++) {
+            if (used[i]) continue;
+            int d = abs(BLOCK_ROWS[i] - fromRow);
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+        }
+        used[bestIdx] = true;
+        order[n++] = BLOCK_ROWS[bestIdx];
+        fromRow = BLOCK_ROWS[bestIdx];
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (checkEmergencyStop()) return -1;
+        int row = order[i];
+        Bridge.print(F("[SEARCH] Checking block at row "));
+        Bridge.println(row);
+
+        // Drive to the grid node just east of this block, facing WEST.
+        moveCoord(1, row);
+        if (emergencyStopActive) return -1;
+        turnToHeading(WEST);
+
+        sensorsEnabled = true;
+        bool grabbed = moveToGrab(targetColour, SEARCH_APPROACH_SPEED);
+        if (emergencyStopActive) return -1;
+
+        if (grabbed) {
+            Bridge.print(F("[SEARCH] Match found and grabbed at row "));
+            Bridge.println(row);
+            return row;
+        }
+
+        // Wrong colour: back off and (if any remain) hop to the next block.
+        Bridge.println(F("[SEARCH] Wrong colour — reversing to try next block."));
+        backOffBlock();
+        if (emergencyStopActive) return -1;
+    }
+
+    Bridge.println(F("[SEARCH] No matching block found — returning home."));
+    moveHome();
+    return -1;
+}
+
+// Full mission with colour search: hunt the target colour across the 3 blocks,
+// and if one is grabbed, carry it home and drop it. Starts the search at the
+// block associated with the pressed button (path1->row1, path2->row3,
+// path3->row5).
+void searchGrabAndDrop(int targetColour, int startRow) {
+    if (checkEmergencyStop()) return;
+    openClawWithAttach();          // start with an open gripper
+    resetCoordinates();            // assume we begin at home (4,3) facing WEST
+
+    int grabbedRow = searchAndGrab(targetColour, startRow);
+    if (emergencyStopActive) return;
+
+    if (grabbedRow < 0) {
+        // searchAndGrab already drove home on a total miss.
+        gridStop();
+        return;
+    }
+
+    // Back off the block onto the grid node before navigating home — the grab
+    // approach crept WEST past node (1,row) onto the block at (0,row), so the
+    // car's physical position is ~1 block west of its tracked coordinate.
+    backOffBlock();
+    if (emergencyStopActive) return;
+
+    // Carry the grabbed block home and out to the drop zone.
+    moveHome();
+    if (emergencyStopActive) return;
+    goToDrop();
+    if (emergencyStopActive) return;
+    delay(300);
+    openClawWithAttach();          // release at the drop zone
+    resetCoordinates();
 }
 
 // ── Array Based Instruction Execution ───────────────────────────────────────
@@ -820,9 +1016,18 @@ void executeAutoMission(int targetY, int color) {
 // is prefixed "[ACK]" so the dashboard can distinguish command echoes from
 // normal telemetry.
 void handleSerialCommand() {
-    if (!Serial.available()) return;
-
-    String line = Serial.readStringUntil('\n');
+    // Accept commands from EITHER link: the USB Serial Monitor (wired debug) or
+    // the ESP32 wireless bridge on espSerial. Read a line from whichever has
+    // data this tick; replies go out through Bridge (both links) so both
+    // dashboards see the [ACK]/telemetry response.
+    String line;
+    if (Serial.available()) {
+        line = Serial.readStringUntil('\n');
+    } else if (espSerial.available()) {
+        line = espSerial.readStringUntil('\n');
+    } else {
+        return;
+    }
     line.trim();
     if (line.length() == 0) return;
 
@@ -841,65 +1046,75 @@ void handleSerialCommand() {
     if (verb == "STOP") {
         emergencyStopActive = true;
         gridStop();
-        Serial.println(F("[ACK] STOP — motors halted, e-stop latched"));
+        Bridge.println(F("[ACK] STOP — motors halted, e-stop latched"));
         return;
     }
     if (verb == "RESUME" || verb == "ARM") {
         emergencyStopActive = false;
-        Serial.println(F("[ACK] RESUME — e-stop cleared, ready"));
+        Bridge.println(F("[ACK] RESUME — e-stop cleared, ready"));
         return;
     }
 
     // Any other command is refused while latched, so the dashboard STOP stays
     // authoritative until explicitly resumed.
     if (emergencyStopActive) {
-        Serial.println(F("[ACK] IGNORED — e-stop active, send RESUME first"));
+        Bridge.println(F("[ACK] IGNORED — e-stop active, send RESUME first"));
         return;
     }
 
     sensorsEnabled = true;
 
     if (verb == "FWD") {
-        Serial.print(F("[ACK] FWD ")); Serial.println(arg);
+        Bridge.print(F("[ACK] FWD ")); Bridge.println(arg);
         gridMoveForwardBlocks(arg > 0 ? arg : 1, SPEED_START_FAST);
     } else if (verb == "STEP") {                 // single grid coordinate
-        Serial.println(F("[ACK] STEP one coord"));
+        Bridge.println(F("[ACK] STEP one coord"));
         gridMoveForwardOneCoord(SPEED_START_FAST);
     } else if (verb == "LFT") {
-        Serial.println(F("[ACK] LFT rotate 90 left"));
+        Bridge.println(F("[ACK] LFT rotate 90 left"));
         gridRotateLeft90();
     } else if (verb == "RGT") {
-        Serial.println(F("[ACK] RGT rotate 90 right"));
+        Bridge.println(F("[ACK] RGT rotate 90 right"));
         gridRotateRight90();
     } else if (verb == "REV") {
-        Serial.println(F("[ACK] REV slight reverse"));
+        Bridge.println(F("[ACK] REV slight reverse"));
         gridSlightReverse();
     } else if (verb == "GRB") {                  // arg = target color (0-3)
-        Serial.print(F("[ACK] GRB target ")); Serial.println(gridColorName(arg));
+        Bridge.print(F("[ACK] GRB target ")); Bridge.println(gridColorName(arg));
         moveToGrab((arg >= RED && arg <= ANY) ? arg : ANY);
     } else if (verb == "DRP" || verb == "OPEN") {
-        Serial.println(F("[ACK] DRP open claw"));
+        Bridge.println(F("[ACK] DRP open claw"));
         openClawWithAttach();
     } else if (verb == "PING") {                 // read sensors on demand
         int distance = gridGetDistanceCm();
         int color = gridDetectColorValue();
-        Serial.println(F("[ACK] PING"));
+        Bridge.println(F("[ACK] PING"));
         printStatusTelemetry(distance, color);
     } else if (verb == "SENSORS") {              // raw line-sensor snapshot
-        Serial.print(F("[ACK] SENSORS L="));
-        Serial.print(digitalRead(LINE_LEFT_PIN));
-        Serial.print(F(" C=")); Serial.print(digitalRead(LINE_CENTER_PIN));
-        Serial.print(F(" R=")); Serial.println(digitalRead(LINE_RIGHT_PIN));
+        Bridge.print(F("[ACK] SENSORS L="));
+        Bridge.print(digitalRead(LINE_LEFT_PIN));
+        Bridge.print(F(" C=")); Bridge.print(digitalRead(LINE_CENTER_PIN));
+        Bridge.print(F(" R=")); Bridge.println(digitalRead(LINE_RIGHT_PIN));
     } else if (verb == "PATH") {                 // arg encodes path*10 + color
         int p = arg / 10, c = arg % 10;
-        Serial.print(F("[ACK] PATH ")); Serial.print(p);
-        Serial.print(F(" color ")); Serial.println(gridColorName(c));
+        Bridge.print(F("[ACK] PATH ")); Bridge.print(p);
+        Bridge.print(F(" color ")); Bridge.println(gridColorName(c));
         if (p == 1) runPath(path1, sizeof(path1)/sizeof(Step), c);
         else if (p == 2) runPath(path2, sizeof(path2)/sizeof(Step), c);
         else if (p == 3) runPath(path3, sizeof(path3)/sizeof(Step), c);
+    } else if (verb == "SEARCH") {               // arg encodes color*10 + startRow
+        // Mirrors the 9 IR-remote mission buttons: searchGrabAndDrop(color, row)
+        // with color 0=RED 1=BLUE 2=YELLOW and startRow 1/3/5 — so the dashboard
+        // can debug the exact routine each remote button runs.
+        int c = arg / 10, r = arg % 10;
+        if (!(r == 1 || r == 3 || r == 5)) r = 1;
+        if (c < RED || c > YELLOW) c = RED;
+        Bridge.print(F("[ACK] SEARCH ")); Bridge.print(gridColorName(c));
+        Bridge.print(F(" from row ")); Bridge.println(r);
+        searchGrabAndDrop(c, r);
     } else if (verb == "RESET") {
         resetCoordinates();
-        Serial.println(F("[ACK] RESET coordinates"));
+        Bridge.println(F("[ACK] RESET coordinates"));
     } else if (verb == "TELEMETRY" || verb == "TEL") {
         // TELEMETRY with no arg toggles, with arg 0/1 sets off/on
         if (line.indexOf(':') >= 0) {
@@ -907,18 +1122,19 @@ void handleSerialCommand() {
         } else {
             debugTelemetry = !debugTelemetry;
         }
-        Serial.print(F("[ACK] TELEMETRY "));
-        Serial.println(debugTelemetry ? F("ON") : F("OFF"));
+        Bridge.print(F("[ACK] TELEMETRY "));
+        Bridge.println(debugTelemetry ? F("ON") : F("OFF"));
     } else {
-        Serial.print(F("[ACK] UNKNOWN command: "));
-        Serial.println(verb);
+        Bridge.print(F("[ACK] UNKNOWN command: "));
+        Bridge.println(verb);
     }
 }
 
 void setup() {
     Serial.begin(9600);
+    espSerial.begin(9600);   // ESP32 wireless bridge link (pins 11 RX / 10 TX)
     delay(200);
-    Serial.println(F("[BOOT] Serial @9600"));
+    Bridge.println(F("[BOOT] Serial @9600 + ESP32 bridge @9600"));
 
     pinMode(LINE_LEFT_PIN, INPUT);
     pinMode(LINE_CENTER_PIN, INPUT);
@@ -935,12 +1151,19 @@ void setup() {
     digitalWrite(COLOR_S0_PIN, HIGH);
     digitalWrite(COLOR_S1_PIN, LOW);
 
+    // Open the gripper as soon as power is up.
     openClawWithAttach();
     mecCar.Init();
     gridSetSpeed(SPEED_START_FAST);
     IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
 
-    Serial.println(F("=== Turn-Locked Autonomous Controller ==="));
+    // Re-open once more now that the motor bus + IR are initialized and the
+    // power rail has settled. The very first open (above) can be dropped by the
+    // power-on inrush brownout, so this second pass guarantees the claw ends up
+    // open every time the robot is turned on.
+    openClawWithAttach();
+
+    Bridge.println(F("=== Turn-Locked Autonomous Controller ==="));
     // Print an immediate telemetry snapshot at startup
     telemetryReport();
     lastTelemetryMillis = millis();
@@ -961,28 +1184,31 @@ void loop() {
         if (key == CMD_STAR) {
             emergencyStopActive = true;
             gridStop();
-            Serial.println(F("\n!!! EMERGENCY STOP TRIGGERED VIA LOOP !!!"));
+            Bridge.println(F("\n!!! EMERGENCY STOP TRIGGERED VIA LOOP !!!"));
             IrReceiver.resume();
             return;
         }
 
         if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
-            Serial.print(F("Key Pressed: "));
-            Serial.println(key);
+            Bridge.print(F("Key Pressed: "));
+            Bridge.println(key);
             emergencyStopActive = false; 
 
             switch (key) {
-                case 22: runPath(path1, sizeof(path1)/sizeof(Step), RED); break; // button 1
-                case 25: runPath(path2, sizeof(path2)/sizeof(Step), RED); break; // button 2
-                case 13: runPath(path3, sizeof(path3)/sizeof(Step), RED); break; // button 3
- 
-                case 12: runPath(path1, sizeof(path1)/sizeof(Step), BLUE); break; // button 1
-                case 24: runPath(path2, sizeof(path2)/sizeof(Step), BLUE); break; // button 2
-                case 94: runPath(path3, sizeof(path3)/sizeof(Step), BLUE); break; // button 3
- 
-                case 8: runPath(path1, sizeof(path1)/sizeof(Step), YELLOW); break; // button 1
-                case 28: runPath(path2, sizeof(path2)/sizeof(Step), YELLOW); break; // button 2
-                case 90: runPath(path3, sizeof(path3)/sizeof(Step), YELLOW); break; // button 3
+                // Each button starts the colour search at its associated block
+                // (path1->row1, path2->row3, path3->row5), then hops to the
+                // other blocks nearest-first until the target colour is found.
+                case 22: searchGrabAndDrop(RED, 1); break; // button 1
+                case 25: searchGrabAndDrop(RED, 3); break; // button 2
+                case 13: searchGrabAndDrop(RED, 5); break; // button 3
+
+                case 12: searchGrabAndDrop(BLUE, 1); break; // button 1
+                case 24: searchGrabAndDrop(BLUE, 3); break; // button 2
+                case 94: searchGrabAndDrop(BLUE, 5); break; // button 3
+
+                case 8:  searchGrabAndDrop(YELLOW, 1); break; // button 1
+                case 28: searchGrabAndDrop(YELLOW, 3); break; // button 2
+                case 90: searchGrabAndDrop(YELLOW, 5); break; // button 3
 
                 // case 12: executeAutoMission(1, BLUE); break;              // button 4
                 // case 24: executeAutoMission(3, BLUE); break;              // button 5
@@ -1001,7 +1227,7 @@ void loop() {
                     openClawWithAttach();
                     resetCoordinates();
                     sensorsEnabled = true;
-                    Serial.println(F("[SYSTEM] OK pressed — reset complete."));
+                    Bridge.println(F("[SYSTEM] OK pressed — reset complete."));
                     break;
                 default: break;
             }

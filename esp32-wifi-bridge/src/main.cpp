@@ -1,168 +1,182 @@
-// ESP32 WiFi bridge for the mecanum car.
+// ESP32 wireless control bridge for the mecanum car (web dashboard build).
 //
-// The Uno (../src/MainLatest.cpp) has no WiFi, so it sends one JSON
-// telemetry line per state change (command start/finish, block progress,
-// e-stop) over a SoftwareSerial link. This sketch relays each line to
-// Favoriot over MQTT (mqtt.favoriot.com:1883) rather than plain HTTP POST,
-// so the device shows as connected/online on the Favoriot dashboard — a
-// stateless HTTP request per event never registers as a live connection.
+// The Uno (../../src/FinalSequence.cpp) has no WiFi. This sketch:
+//   1. Joins your WiFi and serves a control dashboard (dashboard-wifi.html,
+//      embedded gzipped in dashboard_html.h) on http://<esp32-ip>/ and
+//      http://mecanumcar.local/.
+//   2. Opens a WebSocket at /ws. Text frames from the browser are forwarded
+//      verbatim to the Uno over Serial2 (the same newline-terminated commands
+//      the USB dashboard sent: "FWD:2", "LFT", "GRB:0", "STOP", ...).
+//   3. Reads the Uno's telemetry/log lines back from Serial2 and broadcasts
+//      each line to every connected WebSocket client in real time.
 //
-// It also polls Favoriot's REST API for a "remote_cmd" field (set by a
-// Control widget on the dashboard) and forwards it to the Uno, so the
-// dashboard can drive the car the same way the IR remote does. Polling
-// rather than a push mechanism because Favoriot's MQTT "Send to Device"
-// delivery path (RPC) has no documented REST/MQTT contract, and using the
-// device's own access token for a second simultaneous MQTT subscriber
-// caused the broker to fight over the session — polling avoids both.
+// No cloud, no polling — commands and telemetry are ~milliseconds over the LAN.
 //
-// Wiring (matches lib/main.cpp's convention):
-//   Uno pin 11 (RX) <- ESP32 pin 17 (TX2)
-//   Uno pin 10 (TX) -> ESP32 pin 16 (RX2)
-//   Common GND between Uno and ESP32.
+// Wiring (Uno <-> ESP32, plus common GND):
+//   Uno RX (pin 0 / USB-serial) is used by the dashboard link, so the Uno
+//   talks to the ESP32 over its hardware Serial (same pins the USB dashboard
+//   used). Connect:
+//     Uno TX (pin 1) ---[divider]--> ESP32 RX2 (GPIO16)
+//     Uno RX (pin 0) <-------------- ESP32 TX2 (GPIO17)
+//   IMPORTANT: level-shift the Uno's 5V TX down to 3.3V for ESP32 RX2
+//   (a 2k/3.3k divider, or a logic-level shifter). ESP32 TX2 -> Uno RX is fine
+//   at 3.3V since the Uno reads >2.5V as HIGH.
+//   The Uno's Serial runs at 9600 (FinalSequence.cpp Serial.begin(9600)), so
+//   Serial2 here matches at 9600.
+//
+//   NOTE: if you keep the Uno plugged into USB for its own serial monitor, that
+//   shares the Uno's single hardware UART with pins 0/1 — don't drive both at
+//   once. For the wireless setup, power the Uno without USB serial and wire
+//   pins 0/1 to the ESP32 as above.
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
 #include "secrets.h"
+#include "dashboard_html.h"
 
-// Favoriot authenticates MQTT clients using the device's access token (not
-// the account API key) as both username and password; the stream-publish
-// topic is "<access_token>/v2/streams".
-const char* MQTT_BROKER = "mqtt.favoriot.com";
-const int MQTT_PORT = 1883;
-const char* MQTT_TOPIC = DEVICE_ACCESS_TOKEN "/v2/streams";
+// The Uno's Serial (FinalSequence.cpp) is 9600 baud.
+#define UNO_BAUD 9600
+#define RXD2 16   // ESP32 RX2  <- Uno TX (level-shifted to 3.3V)
+#define TXD2 17   // ESP32 TX2  -> Uno RX
+#define MDNS_HOST "mecanumcar"   // reachable at http://mecanumcar.local/
 
-// Reading streams back (as opposed to publishing them) uses the account API
-// key over REST, not the device access token.
-const char* FAVORIOT_STREAMS_ENDPOINT = "https://apiv2.favoriot.com/v2/streams";
-const unsigned long REMOTE_POLL_INTERVAL_MS = 3000;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
-#define RXD2 16
-#define TXD2 17
+// Commands from WebSocket clients are captured in the async callback and
+// flushed to the Uno from loop() so we never write Serial2 off the main task.
+String pendingCmd = "";
+volatile bool haveCmd = false;
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+// Assembles Serial2 bytes into lines to broadcast to the browser.
+String unoLineBuf = "";
+
+void broadcastLine(const String &line) {
+  // WebSocket text frame per line; the browser splits on newlines anyway.
+  ws.textAll(line);
+}
+
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("[ws] client #%u connected from %s\n",
+                    client->id(), client->remoteIP().toString().c_str());
+      client->text("[dashboard] websocket connected to ESP32 bridge");
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("[ws] client #%u disconnected\n", client->id());
+      break;
+    case WS_EVT_DATA: {
+      AwsFrameInfo *info = (AwsFrameInfo *)arg;
+      // Only handle unfragmented, final text frames (commands are tiny).
+      if (info->final && info->index == 0 && info->len == len &&
+          info->opcode == WS_TEXT) {
+        String cmd;
+        cmd.reserve(len);
+        for (size_t i = 0; i < len; i++) cmd += (char)data[i];
+        cmd.trim();
+        if (cmd.length()) {
+          pendingCmd = cmd;
+          haveCmd = true;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
 
 void connectWiFi() {
-  Serial.println("\nConnecting to WiFi...");
+  Serial.printf("\n[wifi] connecting to \"%s\"...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // lower latency for control
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(400);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
-}
-
-void connectMqtt() {
-  while (!mqttClient.connected()) {
-    Serial.println("Connecting to Favoriot MQTT broker...");
-    String clientId = "esp32-mecanumcar-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    if (mqttClient.connect(clientId.c_str(), DEVICE_ACCESS_TOKEN, DEVICE_ACCESS_TOKEN)) {
-      Serial.println("MQTT connected!");
-    } else {
-      Serial.print("MQTT connect failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" retrying in 2s...");
-      delay(2000);
-    }
-  }
-}
-
-// Polls the latest few streams for this device and forwards any newly-seen
-// "remote_cmd" field to the Uno. Skips acting on anything already present
-// at boot (baseline set on the first poll) so old dashboard button presses
-// from a previous session don't replay.
-void pollRemoteCommand() {
-  static unsigned long lastPollMs = 0;
-  static long long lastProcessedTimestamp = -1;
-
-  if (millis() - lastPollMs < REMOTE_POLL_INTERVAL_MS) return;
-  lastPollMs = millis();
-
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  String url = String(FAVORIOT_STREAMS_ENDPOINT) +
-               "?device_developer_id=" + DEVICE_DEVELOPER_ID + "&max=5&order=DESC";
-  http.begin(url);
-  http.addHeader("apikey", FAVORIOT_APIKEY);
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    return;
-  }
-  String body = http.getString();
-  http.end();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, body)) return;
-
-  JsonArray results = doc["results"].as<JsonArray>();
-  if (results.size() == 0) return;
-
-  if (lastProcessedTimestamp < 0) {
-    lastProcessedTimestamp = results[0]["timestamp"].as<long long>();
-    Serial.println("Remote command polling baseline set.");
-    return;
-  }
-
-  // Results are newest-first; walk oldest-to-newest within this batch so
-  // multiple queued commands dispatch to the Uno in the order they were sent.
-  for (int i = results.size() - 1; i >= 0; i--) {
-    JsonObject entry = results[i];
-    long long ts = entry["timestamp"].as<long long>();
-    if (ts <= lastProcessedTimestamp) continue;
-    if (ts > lastProcessedTimestamp) lastProcessedTimestamp = ts;
-
-    if (!entry["data"]["remote_cmd"].is<const char*>()) continue;
-    const char* remoteCmd = entry["data"]["remote_cmd"];
-    Serial.print("Remote command from dashboard: ");
-    Serial.println(remoteCmd);
-    Serial2.println(remoteCmd);
-  }
+  Serial.printf("\n[wifi] connected. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  Serial2.begin(UNO_BAUD, SERIAL_8N1, RXD2, TXD2);
 
   connectWiFi();
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  // Default 256-byte buffer is too small once the API key (used in both the
-  // topic and as username/password) is a ~140-char JWT plus the JSON payload.
-  mqttClient.setBufferSize(512);
-  connectMqtt();
+
+  if (MDNS.begin(MDNS_HOST)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[mdns] http://%s.local/\n", MDNS_HOST);
+  } else {
+    Serial.println("[mdns] failed to start");
+  }
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // Serve the gzip-compressed dashboard from PROGMEM. Answer both GET (browsers)
+  // and HEAD (health checkers / `curl -I`) so a HEAD probe doesn't 404.
+  server.on("/", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
+    AsyncWebServerResponse *res = req->beginResponse_P(
+        200, "text/html; charset=utf-8", DASHBOARD_HTML_GZ, DASHBOARD_HTML_GZ_LEN);
+    res->addHeader("Content-Encoding", "gzip");
+    req->send(res);
+  });
+
+  // Lightweight health check / IP echo.
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
+    String j = "{\"ip\":\"" + WiFi.localIP().toString() +
+               "\",\"clients\":" + String(ws.count()) +
+               ",\"rssi\":" + String(WiFi.RSSI()) + "}";
+    req->send(200, "application/json", j);
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *req) {
+    req->send(404, "text/plain", "not found");
+  });
+
+  server.begin();
+  Serial.printf("[http] dashboard live at http://%s/\n",
+                WiFi.localIP().toString().c_str());
 }
 
 void loop() {
+  // Reconnect WiFi if it drops.
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
-  if (!mqttClient.connected()) {
-    connectMqtt();
+
+  // 1) Flush any queued command from the browser to the Uno.
+  if (haveCmd) {
+    noInterrupts();
+    String cmd = pendingCmd;
+    haveCmd = false;
+    interrupts();
+    Serial.println("[cmd] -> Uno: " + cmd);
+    Serial2.println(cmd);         // newline-terminated, matches Uno parser
   }
-  mqttClient.loop();
-  pollRemoteCommand();
 
-  if (!Serial2.available()) return;
-
-  String incomingData = Serial2.readStringUntil('\n');
-  incomingData.trim();
-  if (incomingData.length() == 0) return;
-
-  Serial.println("Received from Uno: " + incomingData);
-
-  // incomingData is already a JSON object, e.g.
-  // {"command":"CMD_1","status":"running","sensor_left":0,"sensor_mid":1,"sensor_right":0,"block_count":2}
-  // wrap it as the "data" field of the Favoriot stream payload.
-  String jsonPayload = "{\"device_developer_id\":\"" + String(DEVICE_DEVELOPER_ID) +
-                        "\",\"data\":" + incomingData + "}";
-
-  Serial.println("Publishing to Favoriot...");
-  if (mqttClient.publish(MQTT_TOPIC, jsonPayload.c_str())) {
-    Serial.println("SUCCESS: Published to Favoriot!");
-  } else {
-    Serial.println("ERROR: MQTT publish failed.");
+  // 2) Read telemetry/log lines from the Uno and broadcast each to clients.
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\n') {
+      unoLineBuf.trim();
+      if (unoLineBuf.length()) {
+        Serial.println("[uno] " + unoLineBuf);
+        broadcastLine(unoLineBuf);
+      }
+      unoLineBuf = "";
+    } else if (c != '\r') {
+      unoLineBuf += c;
+      if (unoLineBuf.length() > 240) {   // guard against a runaway line
+        broadcastLine(unoLineBuf);
+        unoLineBuf = "";
+      }
+    }
   }
+
+  ws.cleanupClients();
 }

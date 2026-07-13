@@ -1,0 +1,895 @@
+<meta charset="utf-8">
+<title>MecanumCar · Wireless Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-2: #0e141c;
+    --edge: #1e2732;
+    --edge-hi: #2b3746;
+    --ink: #e6edf3;
+    --ink-dim: #8b96a3;
+    --ink-faint: #5a6672;
+    --phos: #4dd0e1;        /* phosphor cyan accent */
+    --phos-deep: #1b3a40;
+    --good: #5ec26a;
+    --warn: #e0a53d;
+    --crit: #e35d6a;
+    --lit: #7ee787;         /* line sensor lit */
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --r: 10px;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #eef2f6;
+    --panel: #ffffff;
+    --panel-2: #f4f7fa;
+    --edge: #d5dde6;
+    --edge-hi: #c2ccd8;
+    --ink: #16202b;
+    --ink-dim: #566373;
+    --ink-faint: #8695a5;
+    --phos: #0a8ea0;
+    --phos-deep: #cdeef2;
+    --good: #2f9e44;
+    --warn: #c07d16;
+    --crit: #d23f4d;
+    --lit: #2f9e44;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: 2rem;
+  }
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, rgba(77,208,225,0.025) 0 1px, transparent 1px 3px);
+    pointer-events: none; z-index: 999;
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+  header {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    padding: .7rem 1.1rem;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--edge);
+  }
+  .brand { display: flex; align-items: baseline; gap: .55rem; margin-right: auto; }
+  .brand b { font-size: 1.02rem; letter-spacing: .2px; }
+  .brand span {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .conn-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--ink-faint); flex: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink-faint) 25%, transparent);
+  }
+  .conn-dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 30%, transparent); animation: pulse 2s infinite; }
+  .conn-dot.err { background: var(--crit); box-shadow: 0 0 0 3px color-mix(in srgb, var(--crit) 30%, transparent); }
+  @keyframes pulse { 50% { opacity: .45; } }
+  .conn-label { font-family: var(--mono); font-size: .74rem; color: var(--ink-dim); min-width: 8ch; }
+
+  button {
+    font-family: var(--sans); font-size: .82rem; font-weight: 600;
+    color: var(--ink); background: var(--panel-2);
+    border: 1px solid var(--edge-hi); border-radius: 7px;
+    padding: .45rem .85rem; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .05s;
+  }
+  button:hover { border-color: var(--phos); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--phos); outline-offset: 2px; }
+  button.primary { background: var(--phos); color: #04222a; border-color: var(--phos); }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .4; cursor: not-allowed; border-color: var(--edge); }
+  .baud { font-family: var(--mono); font-size: .72rem; color: var(--ink-faint); }
+
+  main { max-width: 1180px; margin: 0 auto; padding: 1.1rem; }
+
+  .estop {
+    display: none;
+    align-items: center; gap: .7rem;
+    margin-bottom: 1rem; padding: .7rem 1rem;
+    border: 1px solid var(--crit); border-radius: var(--r);
+    background: color-mix(in srgb, var(--crit) 16%, var(--panel));
+    color: var(--crit); font-weight: 700; letter-spacing: .02em;
+    animation: alarm 1.1s steps(2, jump-none) infinite;
+  }
+  .estop.show { display: flex; }
+  @keyframes alarm { 50% { background: color-mix(in srgb, var(--crit) 30%, var(--panel)); } }
+  .estop .ico { font-size: 1.1rem; }
+
+  .grid { display: grid; gap: .85rem; grid-template-columns: repeat(12, 1fr); }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: var(--r);
+    padding: .95rem 1rem 1.05rem;
+    display: flex; flex-direction: column; gap: .7rem;
+    min-width: 0;
+  }
+  .card h2 {
+    margin: 0; font-family: var(--mono);
+    font-size: .66rem; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--ink-faint);
+    display: flex; align-items: center; gap: .5rem;
+  }
+  .card h2::before { content: ""; width: 5px; height: 5px; border-radius: 1px; background: var(--phos); }
+
+  .col-6 { grid-column: span 6; }
+  .col-4 { grid-column: span 4; }
+  .col-3 { grid-column: span 3; }
+  .col-12 { grid-column: span 12; }
+  @media (max-width: 860px) { .col-6, .col-4, .col-3 { grid-column: span 6; } }
+  @media (max-width: 520px) { .col-6, .col-4, .col-3, .col-12 { grid-column: span 12; } }
+
+  .sensors { display: flex; justify-content: space-around; gap: .6rem; }
+  .sensor { display: flex; flex-direction: column; align-items: center; gap: .5rem; }
+  .lamp {
+    width: 54px; height: 54px; border-radius: 12px;
+    background: var(--panel-2); border: 1px solid var(--edge-hi);
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
+    transition: background .1s, box-shadow .1s, color .1s, border-color .1s;
+  }
+  .lamp.lit {
+    background: color-mix(in srgb, var(--lit) 28%, var(--panel-2));
+    border-color: var(--lit); color: var(--lit);
+    box-shadow: 0 0 16px -2px color-mix(in srgb, var(--lit) 60%, transparent), inset 0 0 8px color-mix(in srgb, var(--lit) 25%, transparent);
+  }
+  .sensor small { font-family: var(--mono); font-size: .62rem; letter-spacing: .1em; color: var(--ink-dim); }
+  .junction-note { font-family: var(--mono); font-size: .7rem; text-align: center; color: var(--ink-faint); }
+  .junction-note b { color: var(--phos); }
+
+  .readout { display: flex; align-items: baseline; gap: .4rem; }
+  .readout .val {
+    font-family: var(--mono); font-size: 2.5rem; font-weight: 600;
+    line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  .readout .unit { font-family: var(--mono); font-size: .95rem; color: var(--ink-dim); }
+  .dist-bar { height: 7px; border-radius: 4px; background: var(--panel-2); border: 1px solid var(--edge); overflow: hidden; }
+  .dist-bar > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--good), var(--warn), var(--crit));
+    transition: width .2s ease;
+  }
+  .dist-scale { display: flex; justify-content: space-between; font-family: var(--mono); font-size: .58rem; color: var(--ink-faint); }
+
+  .color-chip { display: flex; align-items: center; gap: .7rem; }
+  .swatch {
+    width: 46px; height: 46px; border-radius: 10px;
+    border: 1px solid var(--edge-hi); background: var(--panel-2);
+    flex: none; transition: background .2s, box-shadow .2s;
+  }
+  .swatch[data-c="RED"] { background: #e35d6a; box-shadow: 0 0 14px -3px #e35d6a; border-color: #e35d6a; }
+  .swatch[data-c="BLUE"] { background: #4d8fe1; box-shadow: 0 0 14px -3px #4d8fe1; border-color: #4d8fe1; }
+  .swatch[data-c="YELLOW"] { background: #e6c34d; box-shadow: 0 0 14px -3px #e6c34d; border-color: #e6c34d; }
+  .color-chip .name { font-family: var(--mono); font-size: 1.15rem; font-weight: 600; }
+
+  .state-val { font-family: var(--mono); font-size: 1.25rem; font-weight: 600; }
+  .pill {
+    display: inline-flex; align-items: center; gap: .4rem; align-self: flex-start;
+    font-family: var(--mono); font-size: .72rem; font-weight: 600;
+    padding: .3rem .6rem; border-radius: 999px;
+    border: 1px solid var(--edge-hi); background: var(--panel-2); color: var(--ink-dim);
+  }
+  .pill.turn { color: var(--phos); border-color: color-mix(in srgb, var(--phos) 50%, var(--edge-hi)); }
+  .pill.nav { color: var(--good); border-color: color-mix(in srgb, var(--good) 50%, var(--edge-hi)); }
+  .pill.track { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--edge-hi)); }
+  .pill.idle { color: var(--ink-faint); }
+
+  .key-badge { font-family: var(--mono); font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .key-map { font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); }
+
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: .78rem; }
+  .stat-row + .stat-row { border-top: 1px dashed var(--edge); padding-top: .5rem; }
+  .stat-row .k { color: var(--ink-faint); }
+  .stat-row .v { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  .console-card { gap: .55rem; }
+  .console-head { display: flex; align-items: center; gap: .7rem; }
+  .console-head h2 { margin-right: auto; }
+  .console {
+    font-family: var(--mono); font-size: .76rem; line-height: 1.5;
+    background: var(--panel-2); border: 1px solid var(--edge); border-radius: 8px;
+    height: 260px; overflow-y: auto; padding: .6rem .8rem; scrollbar-width: thin;
+  }
+  .console .line { display: flex; gap: .7rem; white-space: pre-wrap; word-break: break-word; }
+  .console .t { color: var(--ink-faint); flex: none; font-variant-numeric: tabular-nums; }
+  .console .m { color: var(--ink-dim); }
+  .console .m.sys { color: var(--phos); }
+  .console .m.turn { color: #7cc4e6; }
+  .console .m.nav { color: var(--good); }
+  .console .m.track { color: var(--warn); }
+  .console .m.tele { color: var(--ink); }
+  .console .m.crit { color: var(--crit); font-weight: 700; }
+  .console .m.key { color: var(--lit); }
+  .console .m.sent { color: var(--phos); font-weight: 700; }
+  .console .m.ack { color: var(--ink-dim); font-style: italic; }
+  .console:empty::after { content: "Waiting for the robot…"; color: var(--ink-faint); }
+
+  .toggle { font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); display: flex; align-items: center; gap: .4rem; cursor: pointer; user-select: none; }
+  .toggle input { accent-color: var(--phos); }
+
+  .ctl-group { display: flex; flex-direction: column; gap: .5rem; }
+  .ctl-group > .lbl { font-family: var(--mono); font-size: .6rem; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint); }
+  .ctl-row { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
+  .ctl {
+    font-family: var(--mono); font-size: .8rem; font-weight: 600;
+    padding: .5rem .7rem; min-width: 2.6rem;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--edge-hi); border-radius: 7px; cursor: pointer;
+    transition: border-color .12s, background .12s, transform .05s, color .12s;
+  }
+  .ctl:hover:not(:disabled) { border-color: var(--phos); color: var(--phos); }
+  .ctl:active:not(:disabled) { transform: translateY(1px); }
+  .ctl:focus-visible { outline: 2px solid var(--phos); outline-offset: 2px; }
+  .ctl:disabled { opacity: .35; cursor: not-allowed; }
+  .ctl.stop { background: var(--crit); color: #fff; border-color: var(--crit); flex: 1; min-width: 100%; padding: .7rem; font-size: .9rem; letter-spacing: .05em; }
+  .ctl.stop:hover:not(:disabled) { filter: brightness(1.1); color: #fff; }
+  .ctl.arm { border-color: color-mix(in srgb, var(--good) 55%, var(--edge-hi)); color: var(--good); }
+  .ctl.arm:hover:not(:disabled) { border-color: var(--good); }
+  .ctl.wide { flex: 1; min-width: 5rem; }
+  .fwd-input {
+    width: 3rem; font-family: var(--mono); font-size: .8rem; text-align: center;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--edge-hi); border-radius: 7px; padding: .5rem .3rem;
+  }
+  .fwd-input:focus-visible { outline: 2px solid var(--phos); outline-offset: 1px; }
+  .ctl-note { font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); }
+  .seg { display: inline-flex; border: 1px solid var(--edge-hi); border-radius: 7px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: var(--panel-2); padding: .5rem .6rem; font-size: .74rem; }
+  .seg button + button { border-left: 1px solid var(--edge); }
+  .seg button.sel { background: var(--phos-deep); color: var(--phos); }
+
+  .foot { margin-top: 1.4rem; font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); text-align: center; }
+
+  /* IR remote debug panel */
+  .remote-wrap { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+  .remote-grid {
+    flex: 2; min-width: 300px;
+    display: grid; grid-template-columns: 5.2rem repeat(3, 1fr); gap: .45rem;
+    align-items: stretch;
+  }
+  .remote-grid .gh {
+    font-family: var(--mono); font-size: .6rem; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-faint);
+    display: flex; align-items: center; justify-content: center; text-align: center;
+  }
+  .remote-grid .gh.rowlbl { justify-content: flex-start; gap: .45rem; }
+  .remote-grid .gh .cdot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .rbtn {
+    display: flex; flex-direction: column; align-items: flex-start; gap: .15rem;
+    font-family: var(--mono); text-align: left;
+    padding: .55rem .65rem; border-radius: 8px; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--edge-hi); color: var(--ink);
+    transition: border-color .12s, box-shadow .12s, transform .05s;
+    position: relative;
+  }
+  .rbtn:hover:not(:disabled) { border-color: var(--accent-c, var(--phos)); }
+  .rbtn:active:not(:disabled) { transform: translateY(1px); }
+  .rbtn:disabled { opacity: .35; cursor: not-allowed; }
+  .rbtn.ro { cursor: default; }
+  .rbtn.ro:hover { border-color: var(--edge-hi); }
+  .rbtn b { font-size: .82rem; font-weight: 700; }
+  .rbtn small { font-size: .6rem; color: var(--ink-faint); }
+  .rbtn .ir { font-size: .58rem; color: var(--ink-faint); letter-spacing: .08em; }
+  .rbtn.hit {
+    border-color: var(--accent-c, var(--lit));
+    box-shadow: 0 0 16px -2px var(--accent-c, var(--lit)), inset 0 0 10px color-mix(in srgb, var(--accent-c, var(--lit)) 22%, transparent);
+  }
+  .rbtn.hit::after {
+    content: "IR ✓"; position: absolute; top: .35rem; right: .45rem;
+    font-size: .58rem; font-weight: 700; color: var(--accent-c, var(--lit));
+  }
+  .rbtn[data-run] .ir::before { content: "▶ "; color: var(--phos); }
+  .remote-aux { flex: 1; min-width: 210px; display: flex; flex-direction: column; gap: .45rem; }
+  .remote-aux .gh {
+    font-family: var(--mono); font-size: .6rem; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .remote-aux .rbtn { flex-direction: row; align-items: center; gap: .6rem; }
+  .remote-aux .rbtn b { min-width: 2.2rem; }
+  .remote-aux .rbtn small { flex: 1; }
+
+  /* Sensor test bench */
+  .ctl.live-on { background: var(--phos); color: #04222a; border-color: var(--phos); }
+  .ctl.live-on:hover:not(:disabled) { filter: brightness(1.08); color: #04222a; }
+  .test-head { display: flex; align-items: center; gap: .6rem; }
+  .test-head h2 { margin-right: auto; }
+  .live-tag {
+    font-family: var(--mono); font-size: .62rem; letter-spacing: .12em; text-transform: uppercase;
+    padding: .18rem .5rem; border-radius: 999px; border: 1px solid var(--edge-hi);
+    color: var(--ink-faint); background: var(--panel-2);
+  }
+  .live-tag.streaming { color: var(--good); border-color: var(--good); }
+  .live-tag.streaming::before { content: "● "; }
+  .test-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .85rem; }
+  @media (max-width: 640px) { .test-grid { grid-template-columns: 1fr; } }
+  .test-cell {
+    background: var(--panel-2); border: 1px solid var(--edge); border-radius: 8px;
+    padding: .8rem .9rem; display: flex; flex-direction: column; gap: .55rem;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .test-cell.fresh { border-color: var(--phos); box-shadow: 0 0 14px -4px color-mix(in srgb, var(--phos) 60%, transparent); }
+  .test-cell h3 {
+    margin: 0; font-family: var(--mono); font-size: .62rem; font-weight: 600;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint);
+  }
+  .test-cell .age { font-family: var(--mono); font-size: .58rem; color: var(--ink-faint); margin-top: auto; }
+</style>
+
+<header>
+  <div class="brand">
+    <b>MecanumCar</b>
+    <span>FinalSequence · wireless</span>
+  </div>
+  <span class="conn-dot" id="dot"></span>
+  <span class="conn-label" id="connLabel">connecting…</span>
+  <span class="baud" id="hostLabel">ws://—</span>
+  <button id="themeBtn" title="Toggle theme">◑</button>
+  <button id="connectBtn" class="primary">Reconnect</button>
+</header>
+
+<main>
+  <div class="estop" id="estopBanner">
+    <span class="ico">■</span>
+    <span>EMERGENCY STOP ACTIVE — motors halted. Press Re-arm (or a path button on the remote) to resume.</span>
+  </div>
+
+  <div class="grid">
+    <!-- Control panel -->
+    <section class="card col-12" id="controlCard">
+      <h2>Manual control · step debug</h2>
+      <div class="ctl-note" id="ctlHint">Connecting to the robot over WiFi… each button sends one command and runs the same routine the IR remote would.</div>
+
+      <button class="ctl stop" data-cmd="STOP" disabled>■ EMERGENCY STOP</button>
+
+      <div style="display:flex; gap:1.4rem; flex-wrap:wrap;">
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Movement</span>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="LFT" disabled title="Rotate 90° left">↺ Left 90°</button>
+            <button class="ctl" data-cmd="RGT" disabled title="Rotate 90° right">Right 90° ↻</button>
+            <button class="ctl" data-cmd="REV" disabled title="Brief reverse bump">↓ Reverse</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="STEP" disabled title="Advance one grid coordinate">↑ Step 1 coord</button>
+            <span style="display:inline-flex; gap:.3rem; align-items:center;">
+              <button class="ctl" id="fwdBtn" disabled title="Line-follow forward N junctions">↑ Forward</button>
+              <input class="fwd-input" id="fwdN" type="number" min="1" max="9" value="2" disabled aria-label="forward blocks">
+              <span class="ctl-note">blocks</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Claw &amp; grab</span>
+          <div class="ctl-row">
+            <span class="seg" role="group" aria-label="grab target color">
+              <button data-color="0" title="RED">RED</button>
+              <button data-color="1" title="BLUE">BLUE</button>
+              <button data-color="2" title="YELLOW">YEL</button>
+              <button data-color="3" class="sel" title="ANY color">ANY</button>
+            </span>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" id="grabBtn" disabled title="Approach with ultrasonic then close claw">✊ Grab</button>
+            <button class="ctl" data-cmd="DRP" disabled title="Open the claw">✋ Open claw</button>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Sensors &amp; state</span>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="PING" disabled title="Read ultrasonic + color once">⟳ Read distance/color</button>
+            <button class="ctl" data-cmd="SENSORS" disabled title="Snapshot line sensors">⟳ Line sensors</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" id="liveBtn" disabled title="Stream ultrasonic + color every 250ms for sensor testing">◉ Live readings: OFF</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl arm" data-cmd="RESUME" disabled title="Clear e-stop latch">✔ Re-arm</button>
+            <button class="ctl" data-cmd="RESET" disabled title="Reset grid coordinates to home">⌂ Reset coords</button>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Full paths</span>
+          <div class="ctl-row">
+            <button class="ctl wide" data-path="1" disabled title="Run path 1 with selected color">▶ Path 1</button>
+            <button class="ctl wide" data-path="2" disabled title="Run path 2 with selected color">▶ Path 2</button>
+            <button class="ctl wide" data-path="3" disabled title="Run path 3 with selected color">▶ Path 3</button>
+          </div>
+          <span class="ctl-note">runs the chosen color from the grab selector</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- IR remote debug -->
+    <section class="card col-12" id="remoteCard">
+      <div class="test-head">
+        <h2>IR remote debug · 9 mission buttons</h2>
+        <span class="live-tag" id="irLastTag">no press yet</span>
+      </div>
+      <div class="ctl-note">Each cell = one remote button, named by what it actually runs: <b>searchGrabAndDrop(color, start&nbsp;row)</b>. Click ▶ to run the exact same routine from here — or press the physical remote and the matching cell lights up <b>IR ✓</b>, verifying receiver + mapping in one go.</div>
+      <div class="remote-wrap">
+        <div class="remote-grid">
+          <span class="gh"></span>
+          <span class="gh">start row 1</span>
+          <span class="gh">start row 3</span>
+          <span class="gh">start row 5</span>
+
+          <span class="gh rowlbl"><i class="cdot" style="background:#e35d6a"></i>RED</span>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="22" data-run="SEARCH:1"  disabled><b>Search RED</b><small>start row 1 → grab → drop</small><span class="ir">IR 22</span></button>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="25" data-run="SEARCH:3"  disabled><b>Search RED</b><small>start row 3 → grab → drop</small><span class="ir">IR 25</span></button>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="13" data-run="SEARCH:5"  disabled><b>Search RED</b><small>start row 5 → grab → drop</small><span class="ir">IR 13</span></button>
+
+          <span class="gh rowlbl"><i class="cdot" style="background:#4d8fe1"></i>BLUE</span>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="12" data-run="SEARCH:11" disabled><b>Search BLUE</b><small>start row 1 → grab → drop</small><span class="ir">IR 12</span></button>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="24" data-run="SEARCH:13" disabled><b>Search BLUE</b><small>start row 3 → grab → drop</small><span class="ir">IR 24</span></button>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="94" data-run="SEARCH:15" disabled><b>Search BLUE</b><small>start row 5 → grab → drop</small><span class="ir">IR 94</span></button>
+
+          <span class="gh rowlbl"><i class="cdot" style="background:#e6c34d"></i>YELLOW</span>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="8"  data-run="SEARCH:21" disabled><b>Search YELLOW</b><small>start row 1 → grab → drop</small><span class="ir">IR 8</span></button>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="28" data-run="SEARCH:23" disabled><b>Search YELLOW</b><small>start row 3 → grab → drop</small><span class="ir">IR 28</span></button>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="90" data-run="SEARCH:25" disabled><b>Search YELLOW</b><small>start row 5 → grab → drop</small><span class="ir">IR 90</span></button>
+        </div>
+
+        <div class="remote-aux">
+          <span class="gh">other remote keys</span>
+          <button class="rbtn" data-ir="66" data-run="STOP"      disabled><b>✱</b><small>EMERGENCY STOP</small><span class="ir">IR 66</span></button>
+          <button class="rbtn" data-ir="74" data-run="DRP"      disabled><b>#</b><small>open claw</small><span class="ir">IR 74</span></button>
+          <button class="rbtn" data-ir="64" data-run="DRP,RESET" disabled><b>OK</b><small>full reset · open claw + home coords</small><span class="ir">IR 64</span></button>
+          <button class="rbtn ro" data-ir="70" tabindex="-1"><b>▲</b><small>creep forward + grab any · remote only</small><span class="ir">IR 70</span></button>
+          <button class="rbtn ro" data-ir="68" tabindex="-1"><b>◀</b><small>nudge claw closed · remote only</small><span class="ir">IR 68</span></button>
+          <button class="rbtn ro" data-ir="67" tabindex="-1"><b>▶</b><small>nudge claw open · remote only</small><span class="ir">IR 67</span></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sensor test bench -->
+    <section class="card col-12" id="testCard">
+      <div class="test-head">
+        <h2>Sensor test bench</h2>
+        <span class="live-tag" id="liveTag">idle</span>
+        <span class="ctl-note">turn on <b>Live readings</b> to stream ultrasonic + color · aim the remote to test IR</span>
+      </div>
+      <div class="test-grid">
+        <!-- Ultrasonic -->
+        <div class="test-cell" id="cellDist">
+          <h3>Ultrasonic distance</h3>
+          <div class="readout"><span class="val" id="distVal2">--</span><span class="unit">cm</span></div>
+          <div class="dist-bar"><i id="distFill2"></i></div>
+          <div class="dist-scale"><span>0</span><span>grab ≤6</span><span>detect ≤25</span><span>50+</span></div>
+          <div class="age" id="distAge">no reading yet</div>
+        </div>
+        <!-- Color -->
+        <div class="test-cell" id="cellColor">
+          <h3>Color sensor</h3>
+          <div class="color-chip">
+            <div class="swatch" id="swatch2"></div>
+            <span class="name" id="colorName2">—</span>
+          </div>
+          <div class="stat-row" style="border:0; padding:0;"><span class="k">readings</span><span class="v" id="colorCount2">0</span></div>
+          <div class="age" id="colorAge">no reading yet</div>
+        </div>
+        <!-- IR receiver -->
+        <div class="test-cell" id="cellIr">
+          <h3>IR receiver</h3>
+          <div class="readout"><span class="key-badge" id="keyVal2">—</span></div>
+          <div class="key-map" id="keyMap2">press any button on the remote</div>
+          <div class="age" id="irAge">waiting for a press</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Line sensors -->
+    <section class="card col-6">
+      <h2>Line sensors</h2>
+      <div class="sensors">
+        <div class="sensor"><div class="lamp" id="sL">L</div><small>A0 · LEFT</small></div>
+        <div class="sensor"><div class="lamp" id="sC">C</div><small>A1 · CENTER</small></div>
+        <div class="sensor"><div class="lamp" id="sR">R</div><small>A2 · RIGHT</small></div>
+      </div>
+      <div class="junction-note" id="junctionNote">press <b>Line sensors</b> to snapshot L/C/R</div>
+    </section>
+
+    <!-- Current action -->
+    <section class="card col-6">
+      <h2>Current action</h2>
+      <div class="state-val" id="actionVal">Idle</div>
+      <span class="pill idle" id="actionPill">standby</span>
+      <div class="stat-row"><span class="k">last event</span><span class="v" id="lastEvent">—</span></div>
+    </section>
+
+    <!-- Distance -->
+    <section class="card col-4">
+      <h2>Ultrasonic range</h2>
+      <div class="readout"><span class="val" id="distVal">--</span><span class="unit">cm</span></div>
+      <div class="dist-bar"><i id="distFill"></i></div>
+      <div class="dist-scale"><span>0</span><span>grab ≤6</span><span>detect ≤25</span><span>50+</span></div>
+    </section>
+
+    <!-- Color -->
+    <section class="card col-4">
+      <h2>Detected color</h2>
+      <div class="color-chip">
+        <div class="swatch" id="swatch"></div>
+        <span class="name" id="colorName">—</span>
+      </div>
+      <div class="stat-row"><span class="k">readings</span><span class="v" id="colorCount">0</span></div>
+    </section>
+
+    <!-- IR key -->
+    <section class="card col-4">
+      <h2>Last IR command</h2>
+      <div class="readout"><span class="key-badge" id="keyVal">—</span></div>
+      <div class="key-map" id="keyMap">no button pressed yet</div>
+    </section>
+
+    <!-- Session stats -->
+    <section class="card col-12">
+      <h2>Session</h2>
+      <div style="display:flex; gap:2rem; flex-wrap:wrap; font-family:var(--mono); font-size:.8rem;">
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">connected</span><span class="v" id="upTime">00:00</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">lines rx</span><span class="v" id="lineCount">0</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">turns</span><span class="v" id="turnCount">0</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">e-stops</span><span class="v" id="estopCount">0</span></div>
+      </div>
+    </section>
+
+    <!-- Console -->
+    <section class="card col-12 console-card">
+      <div class="console-head">
+        <h2>Robot console</h2>
+        <label class="toggle"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+        <button id="clearBtn">Clear</button>
+      </div>
+      <div class="console" id="console"></div>
+    </section>
+  </div>
+
+  <p class="foot">Wireless over WiFi · ESP32 web server + WebSocket → Uno on Serial2 · reads telemetry, sends commands</p>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  $("themeBtn").addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme");
+    const next = cur === "dark" ? "light" : cur === "light" ? "dark"
+      : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+    document.documentElement.setAttribute("data-theme", next);
+  });
+
+  // ── IR key → meaning (mirrors loop() switch in FinalSequence.cpp) ──
+  const KEYMAP = {
+    22: "Search RED · start row 1",    25: "Search RED · start row 3",    13: "Search RED · start row 5",
+    12: "Search BLUE · start row 1",   24: "Search BLUE · start row 3",   94: "Search BLUE · start row 5",
+    8:  "Search YELLOW · start row 1", 28: "Search YELLOW · start row 3", 90: "Search YELLOW · start row 5",
+    74: "Open claw (#)",               66: "EMERGENCY STOP (*)",
+    70: "UP · creep forward + grab any",
+    67: "RIGHT · nudge claw open",     68: "LEFT · nudge claw closed",
+    64: "OK · full reset",
+  };
+
+  // ── state ──
+  let ws = null, startMs = null, lines = 0, turns = 0, estops = 0, colorReads = 0;
+  let tickHandle = null, reconnectTimer = null, manualClose = false;
+  let grabColor = 3; // ANY by default
+  let liveStreaming = false; // TELEMETRY stream on/off
+
+  const dot = $("dot"), connLabel = $("connLabel"), connectBtn = $("connectBtn");
+  const consoleEl = $("console"), estopBanner = $("estopBanner");
+
+  // The page is served BY the ESP32, so the WebSocket host is the page host.
+  // When opened as a local file (file://) for preview, fall back to a prompt-able default.
+  function wsUrl() {
+    if (location.protocol === "file:") return "ws://mecanumcar.local/ws";
+    return "ws://" + location.host + "/ws";
+  }
+
+  function connect() {
+    manualClose = false;
+    const url = wsUrl();
+    $("hostLabel").textContent = url;
+    setConn("connecting…", "");
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setConn("error", "err");
+      logLine("[dashboard] bad WS url: " + e.message, "crit");
+      scheduleReconnect();
+      return;
+    }
+    ws.addEventListener("open", () => {
+      startMs = performance.now();
+      setConn("online", "on");
+      connectBtn.textContent = "Disconnect";
+      connectBtn.classList.remove("primary");
+      setControlsEnabled(true);
+      clearInterval(tickHandle);
+      tickHandle = setInterval(tickUptime, 1000);
+      logLine("[dashboard] connected to robot", "sys");
+    });
+    ws.addEventListener("message", (ev) => {
+      // ESP32 may batch multiple lines per frame; split on newlines.
+      String(ev.data).split(/\r?\n/).forEach((l) => { if (l.length) handleLine(l); });
+    });
+    ws.addEventListener("close", () => {
+      setConn("offline", "");
+      connectBtn.textContent = "Reconnect";
+      connectBtn.classList.add("primary");
+      setControlsEnabled(false);
+      setLiveStreaming(false); // stream state is unknown once the link drops
+      clearInterval(tickHandle);
+      ws = null;
+      if (!manualClose) scheduleReconnect();
+    });
+    ws.addEventListener("error", () => { setConn("error", "err"); });
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => { if (!ws && !manualClose) connect(); }, 2000);
+  }
+
+  connectBtn.addEventListener("click", () => {
+    if (ws) { manualClose = true; ws.close(); }
+    else connect();
+  });
+
+  function sendCmd(cmd) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { logLine("[dashboard] not connected", "crit"); return; }
+    try {
+      ws.send(cmd);
+      logLine("→ " + cmd, "sent");
+    } catch (e) {
+      logLine("[dashboard] send failed: " + e.message, "crit");
+    }
+  }
+
+  function setControlsEnabled(on) {
+    document.querySelectorAll("#controlCard .ctl, #controlCard .fwd-input, #remoteCard .rbtn[data-run]")
+      .forEach((el) => { el.disabled = !on; });
+    $("ctlHint").textContent = on
+      ? "Live over WiFi. Each button sends one command and runs the same routine the IR remote would."
+      : "Waiting for the robot… each button sends one command and runs the same routine the IR remote would.";
+  }
+
+  document.querySelectorAll("#controlCard [data-cmd]").forEach((btn) => {
+    btn.addEventListener("click", () => sendCmd(btn.dataset.cmd));
+  });
+  $("fwdBtn").addEventListener("click", () => {
+    const n = Math.max(1, Math.min(9, parseInt($("fwdN").value, 10) || 1));
+    sendCmd("FWD:" + n);
+  });
+  $("grabBtn").addEventListener("click", () => sendCmd("GRB:" + grabColor));
+
+  // Live sensor streaming: toggles the firmware's 250ms TELEMETRY stream so
+  // ultrasonic + color update continuously — for waving-your-hand sensor tests.
+  function setLiveStreaming(on) {
+    liveStreaming = on;
+    const btn = $("liveBtn"), tag = $("liveTag");
+    btn.classList.toggle("live-on", on);
+    btn.textContent = on ? "◉ Live readings: ON" : "◉ Live readings: OFF";
+    tag.classList.toggle("streaming", on);
+    tag.textContent = on ? "streaming" : "idle";
+  }
+  $("liveBtn").addEventListener("click", () => {
+    const next = !liveStreaming;
+    sendCmd("TELEMETRY:" + (next ? 1 : 0));
+    setLiveStreaming(next);
+  });
+  document.querySelectorAll("#controlCard .seg button").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#controlCard .seg button").forEach((x) => x.classList.remove("sel"));
+      b.classList.add("sel");
+      grabColor = parseInt(b.dataset.color, 10);
+    });
+  });
+  document.querySelectorAll("#controlCard [data-path]").forEach((btn) => {
+    btn.addEventListener("click", () => sendCmd("PATH:" + (parseInt(btn.dataset.path, 10) * 10 + grabColor)));
+  });
+
+  // IR remote debug panel: each runnable cell sends the command(s) that
+  // reproduce that remote button's routine ("DRP,RESET" sends both in order).
+  document.querySelectorAll("#remoteCard .rbtn[data-run]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      btn.dataset.run.split(",").forEach((c) => sendCmd(c));
+    });
+  });
+
+  // Light up a remote cell when its physical IR code arrives, so a remote
+  // press visibly lands on the action it maps to.
+  const irHitTimers = {};
+  function flashRemoteCell(code) {
+    const btn = document.querySelector('#remoteCard .rbtn[data-ir="' + code + '"]');
+    const tag = $("irLastTag");
+    tag.classList.add("streaming");
+    tag.textContent = btn ? "IR " + code + " ✓ mapped" : "IR " + code + " · unmapped";
+    if (!btn) return;
+    btn.classList.add("hit");
+    clearTimeout(irHitTimers[code]);
+    irHitTimers[code] = setTimeout(() => btn.classList.remove("hit"), 1600);
+  }
+
+  function setConn(label, cls) {
+    connLabel.textContent = label;
+    dot.className = "conn-dot" + (cls ? " " + cls : "");
+  }
+
+  // ── parse one firmware line ──
+  function handleLine(text) {
+    lines++;
+    $("lineCount").textContent = lines;
+
+    let cls = "";
+    let sm = text.match(/^\[ACK\]\s*SENSORS\s+L=(\d)\s+C=(\d)\s+R=(\d)/i);
+    if (sm) { updateLamps(sm[1] === "1", sm[2] === "1", sm[3] === "1"); logLine(text, "ack"); return; }
+    if (/^\[ACK\]/i.test(text)) {
+      if (/STOP/i.test(text)) { setEstop(true); estops++; $("estopCount").textContent = estops; }
+      if (/RESUME|RESET/i.test(text)) setEstop(false);
+      logLine(text, "ack");
+      return;
+    }
+    let m = text.match(/^distance:\s*(-{2,3}|\d+)cm\s*\|\s*color:\s*(.+)$/i);
+    if (m) {
+      cls = "tele"; updateDistance(m[1]); updateColor(m[2].trim());
+    } else if (/^\[AUTO\]\s*distance:/i.test(text)) {
+      const mm = text.match(/distance:\s*(-{2,3}|\d+)cm\s*\|\s*color:\s*(.+)$/i);
+      if (mm) { cls = "tele"; updateDistance(mm[1]); updateColor(mm[2].trim()); }
+    } else if (/^Key Pressed:/i.test(text)) {
+      cls = "key"; updateKey(parseInt(text.replace(/[^0-9-]/g, ""), 10));
+    } else if (/EMERGENCY STOP/i.test(text)) {
+      cls = "crit"; setEstop(true); estops++; $("estopCount").textContent = estops;
+      setAction("E-STOP", "idle", "emergency stop triggered");
+      // The * key never prints "Key Pressed:" — the firmware short-circuits
+      // straight to this message, so light its remote cell from here.
+      if (!/dashboard/i.test(text)) flashRemoteCell(66);
+    } else if (/^\[TURN\]/i.test(text)) {
+      cls = "turn"; turns++; $("turnCount").textContent = turns;
+      const dir = /Left/i.test(text) ? "spin left 90°" : /Right/i.test(text) ? "spin right 90°" : "turning";
+      setAction("Turning", "turn", dir);
+    } else if (/^\[NAVIGATE\]/i.test(text)) {
+      cls = "nav"; setAction("Navigating", "nav", stripTag(text));
+    } else if (/^\[TRACK\]/i.test(text)) {
+      cls = "track"; setAction("Aligning", "track", stripTag(text));
+    } else if (/^\[SEARCH\]/i.test(text)) {
+      cls = "nav"; setAction("Searching", "nav", stripTag(text));
+    } else if (/^\[GRAB\]|^\[GRIPPER\]/i.test(text)) {
+      cls = "track"; setAction("Grabbing", "track", stripTag(text));
+    } else if (/^\[BOOT\]/i.test(text)) {
+      cls = "sys"; setAction("Booting", "idle", stripTag(text));
+    } else if (/^\[SYSTEM\]/i.test(text)) {
+      cls = "sys";
+      if (/Halted/i.test(text)) setAction("Halted", "idle", "robot stopped");
+      else if (/Drop zone/i.test(text)) setAction("Drop zone", "nav", "reached drop zone");
+      else if (/Reset/i.test(text)) { setEstop(false); setAction("Idle", "idle", "tracker reset to home"); }
+      else if (/DISABLED/i.test(text)) $("lastEvent").textContent = "sensors disabled (item held)";
+    } else if (/^===/.test(text)) {
+      cls = "sys"; setEstop(false); setAction("Ready", "idle", "controller booted");
+    }
+    logLine(text, cls);
+  }
+
+  const stripTag = (t) => t.replace(/^\[[A-Z]+\]\s*/i, "");
+
+  // Briefly outline a test-bench cell when a new reading lands, and stamp its
+  // "age" line so you can see the sensor is actually responding live.
+  const freshTimers = {};
+  function markFresh(cellId, ageId) {
+    const cell = $(cellId);
+    cell.classList.add("fresh");
+    clearTimeout(freshTimers[cellId]);
+    freshTimers[cellId] = setTimeout(() => cell.classList.remove("fresh"), 350);
+    $(ageId).textContent = "updated at " + stamp();
+  }
+
+  function updateDistance(token) {
+    const oob = /-/.test(token);
+    const cm = oob ? null : parseInt(token, 10);
+    const pct = oob ? 0 : Math.max(2, Math.min(100, (cm / 50) * 100));
+    [["distVal", "distFill"], ["distVal2", "distFill2"]].forEach(([v, f]) => {
+      $(v).textContent = oob ? "--" : cm;
+      $(f).style.width = pct + "%";
+    });
+    markFresh("cellDist", "distAge");
+  }
+
+  function updateColor(name) {
+    const known = ["RED", "BLUE", "YELLOW"];
+    const up = name.toUpperCase();
+    const c = known.find((k) => up.startsWith(k)) || "";
+    const label = c || "ANY / other";
+    $("swatch").setAttribute("data-c", c);
+    $("swatch2").setAttribute("data-c", c);
+    $("colorName").textContent = label;
+    $("colorName2").textContent = label;
+    colorReads++;
+    $("colorCount").textContent = colorReads;
+    $("colorCount2").textContent = colorReads;
+    markFresh("cellColor", "colorAge");
+  }
+
+  function updateLamps(l, c, r) {
+    $("sL").classList.toggle("lit", l);
+    $("sC").classList.toggle("lit", c);
+    $("sR").classList.toggle("lit", r);
+    const pat = (l ? "L" : "·") + (c ? "C" : "·") + (r ? "R" : "·");
+    let steer = "off line";
+    if (l && c && r) steer = "junction (all HIGH)";
+    else if (!l && c && !r) steer = "centered → advance";
+    else if (r && !l) steer = "drifted left → steer right";
+    else if (l && !r) steer = "drifted right → steer left";
+    $("junctionNote").innerHTML = pat + " — <b>" + steer + "</b>";
+  }
+
+  function updateKey(k) {
+    if (Number.isNaN(k)) return;
+    const meaning = KEYMAP[k] || "unmapped code";
+    $("keyVal").textContent = k;
+    $("keyVal2").textContent = k;
+    $("keyMap").textContent = meaning;
+    $("keyMap2").textContent = meaning;
+    markFresh("cellIr", "irAge");
+    flashRemoteCell(k);
+  }
+
+  function setAction(label, pillCls, event) {
+    $("actionVal").textContent = label;
+    const pill = $("actionPill");
+    pill.className = "pill " + pillCls;
+    pill.textContent = pillCls === "idle" ? "standby" : pillCls;
+    if (event) $("lastEvent").textContent = event;
+  }
+
+  function setEstop(on) { estopBanner.classList.toggle("show", on); }
+
+  function logLine(text, cls) {
+    const wrap = document.createElement("div");
+    wrap.className = "line";
+    const t = document.createElement("span");
+    t.className = "t"; t.textContent = stamp();
+    const m = document.createElement("span");
+    m.className = "m " + (cls || ""); m.textContent = text;
+    wrap.append(t, m);
+    consoleEl.append(wrap);
+    while (consoleEl.childElementCount > 500) consoleEl.firstElementChild.remove();
+    if ($("autoscroll").checked) consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  function stamp() {
+    if (startMs == null) return "0.0s";
+    return ((performance.now() - startMs) / 1000).toFixed(1) + "s";
+  }
+
+  function tickUptime() {
+    if (startMs == null) return;
+    const s = Math.floor((performance.now() - startMs) / 1000);
+    $("upTime").textContent =
+      String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  }
+
+  $("clearBtn").addEventListener("click", () => { consoleEl.innerHTML = ""; });
+
+  connect();
+  window.addEventListener("beforeunload", () => { manualClose = true; if (ws) ws.close(); });
+})();
+</script>

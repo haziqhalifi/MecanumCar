@@ -1,0 +1,766 @@
+<title>MecanumCar · Live Telemetry</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-2: #0e141c;
+    --edge: #1e2732;
+    --edge-hi: #2b3746;
+    --ink: #e6edf3;
+    --ink-dim: #8b96a3;
+    --ink-faint: #5a6672;
+    --phos: #4dd0e1;        /* phosphor cyan accent */
+    --phos-deep: #1b3a40;
+    --good: #5ec26a;
+    --warn: #e0a53d;
+    --crit: #e35d6a;
+    --lit: #7ee787;         /* line sensor lit */
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --r: 10px;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #eef2f6;
+    --panel: #ffffff;
+    --panel-2: #f4f7fa;
+    --edge: #d5dde6;
+    --edge-hi: #c2ccd8;
+    --ink: #16202b;
+    --ink-dim: #566373;
+    --ink-faint: #8695a5;
+    --phos: #0a8ea0;
+    --phos-deep: #cdeef2;
+    --good: #2f9e44;
+    --warn: #c07d16;
+    --crit: #d23f4d;
+    --lit: #2f9e44;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: 2rem;
+  }
+  body::before {
+    /* faint scanline atmosphere, decorative */
+    content: "";
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, rgba(77,208,225,0.025) 0 1px, transparent 1px 3px);
+    pointer-events: none; z-index: 999;
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+  /* ── Top bar ─────────────────────────────────────────── */
+  header {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    padding: .7rem 1.1rem;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--edge);
+  }
+  .brand { display: flex; align-items: baseline; gap: .55rem; margin-right: auto; }
+  .brand b { font-size: 1.02rem; letter-spacing: .2px; }
+  .brand span {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .conn-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--ink-faint); flex: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink-faint) 25%, transparent);
+  }
+  .conn-dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 30%, transparent); animation: pulse 2s infinite; }
+  .conn-dot.err { background: var(--crit); box-shadow: 0 0 0 3px color-mix(in srgb, var(--crit) 30%, transparent); }
+  @keyframes pulse { 50% { opacity: .45; } }
+  .conn-label { font-family: var(--mono); font-size: .74rem; color: var(--ink-dim); min-width: 8ch; }
+
+  button {
+    font-family: var(--sans); font-size: .82rem; font-weight: 600;
+    color: var(--ink); background: var(--panel-2);
+    border: 1px solid var(--edge-hi); border-radius: 7px;
+    padding: .45rem .85rem; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .05s;
+  }
+  button:hover { border-color: var(--phos); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--phos); outline-offset: 2px; }
+  button.primary { background: var(--phos); color: #04222a; border-color: var(--phos); }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .4; cursor: not-allowed; border-color: var(--edge); }
+  .baud { font-family: var(--mono); font-size: .72rem; color: var(--ink-faint); }
+
+  main { max-width: 1180px; margin: 0 auto; padding: 1.1rem; }
+
+  /* ── E-stop banner ───────────────────────────────────── */
+  .estop {
+    display: none;
+    align-items: center; gap: .7rem;
+    margin-bottom: 1rem; padding: .7rem 1rem;
+    border: 1px solid var(--crit); border-radius: var(--r);
+    background: color-mix(in srgb, var(--crit) 16%, var(--panel));
+    color: var(--crit); font-weight: 700; letter-spacing: .02em;
+    animation: alarm 1.1s steps(2, jump-none) infinite;
+  }
+  .estop.show { display: flex; }
+  @keyframes alarm { 50% { background: color-mix(in srgb, var(--crit) 30%, var(--panel)); } }
+  .estop .ico { font-size: 1.1rem; }
+
+  /* ── Card grid ───────────────────────────────────────── */
+  .grid {
+    display: grid; gap: .85rem;
+    grid-template-columns: repeat(12, 1fr);
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--edge);
+    border-radius: var(--r);
+    padding: .95rem 1rem 1.05rem;
+    display: flex; flex-direction: column; gap: .7rem;
+    min-width: 0;
+  }
+  .card h2 {
+    margin: 0; font-family: var(--mono);
+    font-size: .66rem; font-weight: 600; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--ink-faint);
+    display: flex; align-items: center; gap: .5rem;
+  }
+  .card h2::before { content: ""; width: 5px; height: 5px; border-radius: 1px; background: var(--phos); }
+
+  .col-6 { grid-column: span 6; }
+  .col-4 { grid-column: span 4; }
+  .col-3 { grid-column: span 3; }
+  .col-12 { grid-column: span 12; }
+  @media (max-width: 860px) {
+    .col-6, .col-4, .col-3 { grid-column: span 6; }
+  }
+  @media (max-width: 520px) {
+    .col-6, .col-4, .col-3, .col-12 { grid-column: span 12; }
+  }
+
+  /* ── Line sensors ────────────────────────────────────── */
+  .sensors { display: flex; justify-content: space-around; gap: .6rem; }
+  .sensor { display: flex; flex-direction: column; align-items: center; gap: .5rem; }
+  .lamp {
+    width: 54px; height: 54px; border-radius: 12px;
+    background: var(--panel-2); border: 1px solid var(--edge-hi);
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
+    transition: background .1s, box-shadow .1s, color .1s, border-color .1s;
+  }
+  .lamp.lit {
+    background: color-mix(in srgb, var(--lit) 28%, var(--panel-2));
+    border-color: var(--lit); color: var(--lit);
+    box-shadow: 0 0 16px -2px color-mix(in srgb, var(--lit) 60%, transparent), inset 0 0 8px color-mix(in srgb, var(--lit) 25%, transparent);
+  }
+  .sensor small { font-family: var(--mono); font-size: .62rem; letter-spacing: .1em; color: var(--ink-dim); }
+  .junction-note {
+    font-family: var(--mono); font-size: .7rem; text-align: center;
+    color: var(--ink-faint);
+  }
+  .junction-note b { color: var(--phos); }
+
+  /* ── Big readouts ────────────────────────────────────── */
+  .readout { display: flex; align-items: baseline; gap: .4rem; }
+  .readout .val {
+    font-family: var(--mono); font-size: 2.5rem; font-weight: 600;
+    line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  .readout .unit { font-family: var(--mono); font-size: .95rem; color: var(--ink-dim); }
+  .dist-bar {
+    height: 7px; border-radius: 4px; background: var(--panel-2);
+    border: 1px solid var(--edge); overflow: hidden;
+  }
+  .dist-bar > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--good), var(--warn), var(--crit));
+    transition: width .2s ease;
+  }
+  .dist-scale { display: flex; justify-content: space-between; font-family: var(--mono); font-size: .58rem; color: var(--ink-faint); }
+
+  /* color chip */
+  .color-chip {
+    display: flex; align-items: center; gap: .7rem;
+  }
+  .swatch {
+    width: 46px; height: 46px; border-radius: 10px;
+    border: 1px solid var(--edge-hi); background: var(--panel-2);
+    flex: none; transition: background .2s, box-shadow .2s;
+  }
+  .swatch[data-c="RED"] { background: #e35d6a; box-shadow: 0 0 14px -3px #e35d6a; border-color: #e35d6a; }
+  .swatch[data-c="BLUE"] { background: #4d8fe1; box-shadow: 0 0 14px -3px #4d8fe1; border-color: #4d8fe1; }
+  .swatch[data-c="YELLOW"] { background: #e6c34d; box-shadow: 0 0 14px -3px #e6c34d; border-color: #e6c34d; }
+  .color-chip .name { font-family: var(--mono); font-size: 1.15rem; font-weight: 600; }
+
+  /* action / state pills */
+  .state-val { font-family: var(--mono); font-size: 1.25rem; font-weight: 600; }
+  .pill {
+    display: inline-flex; align-items: center; gap: .4rem; align-self: flex-start;
+    font-family: var(--mono); font-size: .72rem; font-weight: 600;
+    padding: .3rem .6rem; border-radius: 999px;
+    border: 1px solid var(--edge-hi); background: var(--panel-2); color: var(--ink-dim);
+  }
+  .pill.turn { color: var(--phos); border-color: color-mix(in srgb, var(--phos) 50%, var(--edge-hi)); }
+  .pill.nav { color: var(--good); border-color: color-mix(in srgb, var(--good) 50%, var(--edge-hi)); }
+  .pill.track { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--edge-hi)); }
+  .pill.idle { color: var(--ink-faint); }
+
+  .key-badge {
+    font-family: var(--mono); font-size: 2rem; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .key-map { font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); }
+
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; font-family: var(--mono); font-size: .78rem; }
+  .stat-row + .stat-row { border-top: 1px dashed var(--edge); padding-top: .5rem; }
+  .stat-row .k { color: var(--ink-faint); }
+  .stat-row .v { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  /* ── Console ─────────────────────────────────────────── */
+  .console-card { gap: .55rem; }
+  .console-head { display: flex; align-items: center; gap: .7rem; }
+  .console-head h2 { margin-right: auto; }
+  .console {
+    font-family: var(--mono); font-size: .76rem; line-height: 1.5;
+    background: var(--panel-2); border: 1px solid var(--edge); border-radius: 8px;
+    height: 260px; overflow-y: auto; padding: .6rem .8rem;
+    scrollbar-width: thin;
+  }
+  .console .line { display: flex; gap: .7rem; white-space: pre-wrap; word-break: break-word; }
+  .console .t { color: var(--ink-faint); flex: none; font-variant-numeric: tabular-nums; }
+  .console .m { color: var(--ink-dim); }
+  .console .m.sys { color: var(--phos); }
+  .console .m.turn { color: #7cc4e6; }
+  .console .m.nav { color: var(--good); }
+  .console .m.track { color: var(--warn); }
+  .console .m.tele { color: var(--ink); }
+  .console .m.crit { color: var(--crit); font-weight: 700; }
+  .console .m.key { color: var(--lit); }
+  .console .m.sent { color: var(--phos); font-weight: 700; }
+  .console .m.ack { color: var(--ink-dim); font-style: italic; }
+  .console:empty::after { content: "Waiting for serial data…"; color: var(--ink-faint); }
+
+  .toggle { font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); display: flex; align-items: center; gap: .4rem; cursor: pointer; user-select: none; }
+  .toggle input { accent-color: var(--phos); }
+
+  /* ── Control panel ───────────────────────────────────── */
+  .ctl-group { display: flex; flex-direction: column; gap: .5rem; }
+  .ctl-group > .lbl { font-family: var(--mono); font-size: .6rem; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint); }
+  .ctl-row { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
+  .ctl {
+    font-family: var(--mono); font-size: .8rem; font-weight: 600;
+    padding: .5rem .7rem; min-width: 2.6rem;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--edge-hi); border-radius: 7px; cursor: pointer;
+    transition: border-color .12s, background .12s, transform .05s, color .12s;
+  }
+  .ctl:hover:not(:disabled) { border-color: var(--phos); color: var(--phos); }
+  .ctl:active:not(:disabled) { transform: translateY(1px); }
+  .ctl:focus-visible { outline: 2px solid var(--phos); outline-offset: 2px; }
+  .ctl:disabled { opacity: .35; cursor: not-allowed; }
+  .ctl.stop { background: var(--crit); color: #fff; border-color: var(--crit); flex: 1; min-width: 100%; padding: .7rem; font-size: .9rem; letter-spacing: .05em; }
+  .ctl.stop:hover:not(:disabled) { filter: brightness(1.1); color: #fff; }
+  .ctl.arm { border-color: color-mix(in srgb, var(--good) 55%, var(--edge-hi)); color: var(--good); }
+  .ctl.arm:hover:not(:disabled) { border-color: var(--good); }
+  .ctl.wide { flex: 1; min-width: 5rem; }
+  .fwd-input {
+    width: 3rem; font-family: var(--mono); font-size: .8rem; text-align: center;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--edge-hi); border-radius: 7px; padding: .5rem .3rem;
+  }
+  .fwd-input:focus-visible { outline: 2px solid var(--phos); outline-offset: 1px; }
+  .ctl-note { font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); }
+  .seg { display: inline-flex; border: 1px solid var(--edge-hi); border-radius: 7px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: var(--panel-2); padding: .5rem .6rem; font-size: .74rem; }
+  .seg button + button { border-left: 1px solid var(--edge); }
+  .seg button.sel { background: var(--phos-deep); color: var(--phos); }
+
+  /* unsupported-browser notice */
+  .notice {
+    display: none; margin-bottom: 1rem; padding: .8rem 1rem;
+    border: 1px solid var(--warn); border-radius: var(--r);
+    background: color-mix(in srgb, var(--warn) 12%, var(--panel));
+    font-size: .85rem; color: var(--ink);
+  }
+  .notice.show { display: block; }
+  .notice code { font-family: var(--mono); background: var(--panel-2); padding: .1rem .35rem; border-radius: 4px; }
+  .foot { margin-top: 1.4rem; font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); text-align: center; }
+</style>
+
+<header>
+  <div class="brand">
+    <b>MecanumCar</b>
+    <span>FinalSequence · live telemetry</span>
+  </div>
+  <span class="conn-dot" id="dot"></span>
+  <span class="conn-label" id="connLabel">offline</span>
+  <span class="baud">9600 8N1</span>
+  <button id="themeBtn" title="Toggle theme">◑</button>
+  <button id="connectBtn" class="primary">Connect robot</button>
+</header>
+
+<main>
+  <div class="notice" id="notice">
+    This dashboard talks to the Arduino over USB using the <b>Web Serial API</b>, which runs in
+    <b>Chrome</b>, <b>Edge</b>, or <b>Opera</b> on desktop. Your current browser doesn't expose it —
+    open this page there, plug in the robot, and hit <code>Connect robot</code>.
+  </div>
+
+  <div class="estop" id="estopBanner">
+    <span class="ico">■</span>
+    <span>EMERGENCY STOP ACTIVE — motors halted. Press any path button on the remote to re-arm.</span>
+  </div>
+
+  <div class="grid">
+    <!-- Control panel -->
+    <section class="card col-12" id="controlCard">
+      <h2>Manual control · step debug</h2>
+      <div class="ctl-note" id="ctlHint">Connect the robot to enable controls. Each button sends one command over USB and runs the same routine the IR remote would.</div>
+
+      <button class="ctl stop" data-cmd="STOP" disabled>■ EMERGENCY STOP</button>
+
+      <div style="display:flex; gap:1.4rem; flex-wrap:wrap;">
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Movement</span>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="LFT" disabled title="Rotate 90° left">↺ Left 90°</button>
+            <button class="ctl" data-cmd="RGT" disabled title="Rotate 90° right">Right 90° ↻</button>
+            <button class="ctl" data-cmd="REV" disabled title="Brief reverse bump">↓ Reverse</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="STEP" disabled title="Advance one grid coordinate">↑ Step 1 coord</button>
+            <span style="display:inline-flex; gap:.3rem; align-items:center;">
+              <button class="ctl" id="fwdBtn" disabled title="Line-follow forward N junctions">↑ Forward</button>
+              <input class="fwd-input" id="fwdN" type="number" min="1" max="9" value="2" disabled aria-label="forward blocks">
+              <span class="ctl-note">blocks</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Claw &amp; grab</span>
+          <div class="ctl-row">
+            <span class="seg" role="group" aria-label="grab target color">
+              <button data-color="0" title="RED">RED</button>
+              <button data-color="1" title="BLUE">BLUE</button>
+              <button data-color="2" title="YELLOW">YEL</button>
+              <button data-color="3" class="sel" title="ANY color">ANY</button>
+            </span>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" id="grabBtn" disabled title="Approach with ultrasonic then close claw">✊ Grab</button>
+            <button class="ctl" data-cmd="DRP" disabled title="Open the claw">✋ Open claw</button>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Sensors &amp; state</span>
+          <div class="ctl-row">
+            <button class="ctl" data-cmd="PING" disabled title="Read ultrasonic + color once">⟳ Read distance/color</button>
+            <button class="ctl" data-cmd="SENSORS" disabled title="Snapshot line sensors">⟳ Line sensors</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl arm" data-cmd="RESUME" disabled title="Clear e-stop latch">✔ Re-arm</button>
+            <button class="ctl" data-cmd="RESET" disabled title="Reset grid coordinates to home">⌂ Reset coords</button>
+          </div>
+        </div>
+
+        <div class="ctl-group" style="flex:1; min-width:220px;">
+          <span class="lbl">Full paths</span>
+          <div class="ctl-row">
+            <button class="ctl wide" data-path="1" disabled title="Run path 1 with selected color">▶ Path 1</button>
+            <button class="ctl wide" data-path="2" disabled title="Run path 2 with selected color">▶ Path 2</button>
+            <button class="ctl wide" data-path="3" disabled title="Run path 3 with selected color">▶ Path 3</button>
+          </div>
+          <span class="ctl-note">runs the chosen color from the grab selector</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Line sensors -->
+    <section class="card col-6">
+      <h2>Line sensors</h2>
+      <div class="sensors">
+        <div class="sensor"><div class="lamp" id="sL">L</div><small>A0 · LEFT</small></div>
+        <div class="sensor"><div class="lamp" id="sC">C</div><small>A1 · CENTER</small></div>
+        <div class="sensor"><div class="lamp" id="sR">R</div><small>A2 · RIGHT</small></div>
+      </div>
+      <div class="junction-note" id="junctionNote">line pattern idle — <b id="steer">—</b></div>
+    </section>
+
+    <!-- Current action -->
+    <section class="card col-6">
+      <h2>Current action</h2>
+      <div class="state-val" id="actionVal">Idle</div>
+      <span class="pill idle" id="actionPill">standby</span>
+      <div class="stat-row"><span class="k">last event</span><span class="v" id="lastEvent">—</span></div>
+    </section>
+
+    <!-- Distance -->
+    <section class="card col-4">
+      <h2>Ultrasonic range</h2>
+      <div class="readout"><span class="val" id="distVal">--</span><span class="unit">cm</span></div>
+      <div class="dist-bar"><i id="distFill"></i></div>
+      <div class="dist-scale"><span>0</span><span>grab ≤6</span><span>detect ≤25</span><span>50+</span></div>
+    </section>
+
+    <!-- Color -->
+    <section class="card col-4">
+      <h2>Detected color</h2>
+      <div class="color-chip">
+        <div class="swatch" id="swatch"></div>
+        <span class="name" id="colorName">—</span>
+      </div>
+      <div class="stat-row"><span class="k">readings</span><span class="v" id="colorCount">0</span></div>
+    </section>
+
+    <!-- IR key -->
+    <section class="card col-4">
+      <h2>Last IR command</h2>
+      <div class="readout"><span class="key-badge" id="keyVal">—</span></div>
+      <div class="key-map" id="keyMap">no button pressed yet</div>
+    </section>
+
+    <!-- Session stats -->
+    <section class="card col-12">
+      <h2>Session</h2>
+      <div style="display:flex; gap:2rem; flex-wrap:wrap; font-family:var(--mono); font-size:.8rem;">
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">connected</span><span class="v" id="upTime">00:00</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">lines rx</span><span class="v" id="lineCount">0</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">turns</span><span class="v" id="turnCount">0</span></div>
+        <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">e-stops</span><span class="v" id="estopCount">0</span></div>
+      </div>
+    </section>
+
+    <!-- Console -->
+    <section class="card col-12 console-card">
+      <div class="console-head">
+        <h2>Serial console</h2>
+        <label class="toggle"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+        <button id="clearBtn">Clear</button>
+      </div>
+      <div class="console" id="console"></div>
+    </section>
+  </div>
+
+  <p class="foot">Two-way USB serial with FinalSequence.cpp @9600 · reads telemetry, sends commands · no data leaves this browser · Web Serial API</p>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  // ── theme toggle ──────────────────────────────────────
+  $("themeBtn").addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme");
+    const next = cur === "dark" ? "light" : cur === "light" ? "dark"
+      : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+    document.documentElement.setAttribute("data-theme", next);
+  });
+
+  // ── IR key → meaning (mirrors loop() switch in FinalSequence.cpp) ──
+  const KEYMAP = {
+    22: "Search RED · start row 1",    25: "Search RED · start row 3",    13: "Search RED · start row 5",
+    12: "Search BLUE · start row 1",   24: "Search BLUE · start row 3",   94: "Search BLUE · start row 5",
+    8:  "Search YELLOW · start row 1", 28: "Search YELLOW · start row 3", 90: "Search YELLOW · start row 5",
+    74: "Open claw (#)",               66: "EMERGENCY STOP (*)",
+    70: "UP · creep forward + grab any",
+    67: "RIGHT · nudge claw open",     68: "LEFT · nudge claw closed",
+    64: "OK · full reset",
+  };
+
+  // ── state ─────────────────────────────────────────────
+  let port = null, reader = null, writer = null, keepReading = false, buf = "";
+  let startMs = null, lines = 0, turns = 0, estops = 0, colorReads = 0;
+  let tickHandle = null;
+  let grabColor = 3; // ANY by default
+  const encoder = new TextEncoder();
+
+  // ── DOM refs ──────────────────────────────────────────
+  const dot = $("dot"), connLabel = $("connLabel"), connectBtn = $("connectBtn");
+  const consoleEl = $("console"), estopBanner = $("estopBanner");
+
+  // Web Serial support gate
+  if (!("serial" in navigator)) {
+    $("notice").classList.add("show");
+    connectBtn.disabled = true;
+    connectBtn.textContent = "Web Serial unavailable";
+  }
+
+  // ── connection ────────────────────────────────────────
+  connectBtn.addEventListener("click", async () => {
+    if (port) { await disconnect(); return; }
+    try {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 9600 });
+      writer = port.writable.getWriter();
+      keepReading = true;
+      startMs = performance.now();
+      setConn("online", "on");
+      connectBtn.textContent = "Disconnect";
+      connectBtn.classList.remove("primary");
+      setControlsEnabled(true);
+      tickHandle = setInterval(tickUptime, 1000);
+      readLoop();
+    } catch (e) {
+      setConn("error", "err");
+      logLine("[dashboard] connection failed: " + e.message, "crit");
+      port = null;
+    }
+  });
+
+  async function disconnect() {
+    keepReading = false;
+    try { if (reader) { await reader.cancel(); reader.releaseLock(); } } catch {}
+    try { if (writer) { writer.releaseLock(); } } catch {}
+    try { if (port) await port.close(); } catch {}
+    port = null; reader = null; writer = null;
+    clearInterval(tickHandle);
+    setConn("offline", "");
+    connectBtn.textContent = "Connect robot";
+    connectBtn.classList.add("primary");
+    setControlsEnabled(false);
+  }
+
+  // ── send a command to the robot ───────────────────────
+  async function sendCmd(cmd) {
+    if (!writer) return;
+    try {
+      await writer.write(encoder.encode(cmd + "\n"));
+      logLine("→ " + cmd, "sent");
+    } catch (e) {
+      logLine("[dashboard] send failed: " + e.message, "crit");
+    }
+  }
+
+  // ── control-panel wiring ──────────────────────────────
+  function setControlsEnabled(on) {
+    document.querySelectorAll("#controlCard .ctl, #controlCard .fwd-input")
+      .forEach((el) => { el.disabled = !on; });
+    $("ctlHint").textContent = on
+      ? "Live. Each button sends one command over USB and runs the same routine the IR remote would."
+      : "Connect the robot to enable controls. Each button sends one command over USB and runs the same routine the IR remote would.";
+  }
+
+  // simple verb buttons
+  document.querySelectorAll("#controlCard [data-cmd]").forEach((btn) => {
+    btn.addEventListener("click", () => sendCmd(btn.dataset.cmd));
+  });
+  // forward N blocks
+  $("fwdBtn").addEventListener("click", () => {
+    const n = Math.max(1, Math.min(9, parseInt($("fwdN").value, 10) || 1));
+    sendCmd("FWD:" + n);
+  });
+  // grab (with selected color)
+  $("grabBtn").addEventListener("click", () => sendCmd("GRB:" + grabColor));
+  // color selector segmented control
+  document.querySelectorAll("#controlCard .seg button").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#controlCard .seg button").forEach((x) => x.classList.remove("sel"));
+      b.classList.add("sel");
+      grabColor = parseInt(b.dataset.color, 10);
+    });
+  });
+  // full paths (path*10 + color)
+  document.querySelectorAll("#controlCard [data-path]").forEach((btn) => {
+    btn.addEventListener("click", () => sendCmd("PATH:" + (parseInt(btn.dataset.path, 10) * 10 + grabColor)));
+  });
+
+  async function readLoop() {
+    const decoder = new TextDecoderStream();
+    const closed = port.readable.pipeTo(decoder.writable).catch(() => {});
+    reader = decoder.readable.getReader();
+    try {
+      while (keepReading) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const raw = buf.slice(0, nl).replace(/\r$/, "");
+          buf = buf.slice(nl + 1);
+          if (raw.length) handleLine(raw);
+        }
+      }
+    } catch (e) {
+      if (keepReading) { setConn("error", "err"); logLine("[dashboard] read error: " + e.message, "crit"); }
+    } finally {
+      try { reader.releaseLock(); } catch {}
+      await closed;
+    }
+  }
+
+  function setConn(label, cls) {
+    connLabel.textContent = label;
+    dot.className = "conn-dot" + (cls ? " " + cls : "");
+  }
+
+  // ── parse one firmware line ───────────────────────────
+  function handleLine(text) {
+    lines++;
+    $("lineCount").textContent = lines;
+
+    let cls = "";
+    // ACK replies from the serial-command handler
+    let sm = text.match(/^\[ACK\]\s*SENSORS\s+L=(\d)\s+C=(\d)\s+R=(\d)/i);
+    if (sm) {
+      updateLamps(sm[1] === "1", sm[2] === "1", sm[3] === "1");
+      logLine(text, "ack");
+      return;
+    }
+    if (/^\[ACK\]/i.test(text)) {
+      if (/STOP/i.test(text)) { setEstop(true); estops++; $("estopCount").textContent = estops; }
+      if (/RESUME|RESET/i.test(text)) setEstop(false);
+      logLine(text, "ack");
+      return;
+    }
+    // Telemetry:  "distance: 25cm | color: RED"   (or "distance: ---cm | color: ...")
+    let m = text.match(/^distance:\s*(-{2,3}|\d+)cm\s*\|\s*color:\s*(.+)$/i);
+    if (m) {
+      cls = "tele";
+      updateDistance(m[1]);
+      updateColor(m[2].trim());
+    } else if (/^Key Pressed:/i.test(text)) {
+      cls = "key";
+      const k = parseInt(text.replace(/[^0-9-]/g, ""), 10);
+      updateKey(k);
+    } else if (/EMERGENCY STOP/i.test(text)) {
+      cls = "crit";
+      setEstop(true);
+      estops++; $("estopCount").textContent = estops;
+      setAction("E-STOP", "idle", "emergency stop triggered");
+    } else if (/^\[TURN\]/i.test(text)) {
+      cls = "turn";
+      turns++; $("turnCount").textContent = turns;
+      const dir = /Left/i.test(text) ? "spin left 90°" : /Right/i.test(text) ? "spin right 90°" : "turning";
+      setAction("Turning", "turn", dir);
+    } else if (/^\[NAVIGATE\]/i.test(text)) {
+      cls = "nav";
+      setAction("Navigating", "nav", stripTag(text));
+    } else if (/^\[TRACK\]/i.test(text)) {
+      cls = "track";
+      setAction("Aligning", "track", stripTag(text));
+    } else if (/^\[SEARCH\]/i.test(text)) {
+      cls = "nav";
+      setAction("Searching", "nav", stripTag(text));
+    } else if (/^\[GRAB\]|^\[GRIPPER\]/i.test(text)) {
+      cls = "track";
+      setAction("Grabbing", "track", stripTag(text));
+    } else if (/^\[BOOT\]/i.test(text)) {
+      cls = "sys";
+      setAction("Booting", "idle", stripTag(text));
+    } else if (/^\[SYSTEM\]/i.test(text)) {
+      cls = "sys";
+      if (/Halted/i.test(text)) setAction("Halted", "idle", "robot stopped");
+      else if (/Drop zone/i.test(text)) setAction("Drop zone", "nav", "reached drop zone");
+      else if (/Reset/i.test(text)) { setEstop(false); setAction("Idle", "idle", "tracker reset to home"); }
+      else if (/DISABLED/i.test(text)) $("lastEvent").textContent = "sensors disabled (item held)";
+    } else if (/^===/.test(text)) {
+      cls = "sys";
+      setEstop(false);
+      setAction("Ready", "idle", "controller booted");
+    }
+    logLine(text, cls);
+  }
+
+  const stripTag = (t) => t.replace(/^\[[A-Z]+\]\s*/i, "");
+
+  // ── widget updates ────────────────────────────────────
+  function updateDistance(token) {
+    const el = $("distVal"), fill = $("distFill");
+    if (/-/.test(token)) {
+      el.textContent = "--";
+      fill.style.width = "0%";
+      return;
+    }
+    const cm = parseInt(token, 10);
+    el.textContent = cm;
+    fill.style.width = Math.max(2, Math.min(100, (cm / 50) * 100)) + "%";
+  }
+
+  function updateColor(name) {
+    const known = ["RED", "BLUE", "YELLOW"];
+    const up = name.toUpperCase();
+    const c = known.find((k) => up.startsWith(k)) || "";
+    $("swatch").setAttribute("data-c", c);
+    $("colorName").textContent = c || "ANY / other";
+    colorReads++; $("colorCount").textContent = colorReads;
+  }
+
+  function updateLamps(l, c, r) {
+    $("sL").classList.toggle("lit", l);
+    $("sC").classList.toggle("lit", c);
+    $("sR").classList.toggle("lit", r);
+    const pat = (l ? "L" : "·") + (c ? "C" : "·") + (r ? "R" : "·");
+    let steer = "off line";
+    if (l && c && r) steer = "junction (all HIGH)";
+    else if (!l && c && !r) steer = "centered → advance";
+    else if (r && !l) steer = "drifted left → steer right";
+    else if (l && !r) steer = "drifted right → steer left";
+    $("junctionNote").innerHTML = pat + " — <b>" + steer + "</b>";
+  }
+
+  function updateKey(k) {
+    if (Number.isNaN(k)) return;
+    $("keyVal").textContent = k;
+    $("keyMap").textContent = KEYMAP[k] || "unmapped code";
+  }
+
+  function setAction(label, pillCls, event) {
+    $("actionVal").textContent = label;
+    const pill = $("actionPill");
+    pill.className = "pill " + pillCls;
+    pill.textContent = pillCls === "idle" ? "standby" : pillCls;
+    if (event) $("lastEvent").textContent = event;
+  }
+
+  function setEstop(on) {
+    estopBanner.classList.toggle("show", on);
+  }
+
+  // ── console ───────────────────────────────────────────
+  function logLine(text, cls) {
+    const wrap = document.createElement("div");
+    wrap.className = "line";
+    const t = document.createElement("span");
+    t.className = "t";
+    t.textContent = stamp();
+    const m = document.createElement("span");
+    m.className = "m " + (cls || "");
+    m.textContent = text;
+    wrap.append(t, m);
+    consoleEl.append(wrap);
+    while (consoleEl.childElementCount > 500) consoleEl.firstElementChild.remove();
+    if ($("autoscroll").checked) consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  function stamp() {
+    if (startMs == null) return "0.0s";
+    const s = (performance.now() - startMs) / 1000;
+    return s.toFixed(1) + "s";
+  }
+
+  function tickUptime() {
+    if (startMs == null) return;
+    const s = Math.floor((performance.now() - startMs) / 1000);
+    const mm = String(Math.floor(s / 60)).padStart(2, "0");
+    const ss = String(s % 60).padStart(2, "0");
+    $("upTime").textContent = mm + ":" + ss;
+  }
+
+  $("clearBtn").addEventListener("click", () => { consoleEl.innerHTML = ""; });
+
+  // Line-sensor lamps update on demand: press "Line sensors" to snapshot L/C/R.
+  $("junctionNote").innerHTML = 'press <b>Line sensors</b> to snapshot L/C/R';
+
+  window.addEventListener("beforeunload", () => { if (port) disconnect(); });
+})();
+</script>
