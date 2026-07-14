@@ -415,11 +415,8 @@
         <div class="ctl-group" style="flex:1; min-width:220px;">
           <span class="lbl">Sensors &amp; state</span>
           <div class="ctl-row">
-            <button class="ctl" data-cmd="PING" disabled title="Read ultrasonic + color once">⟳ Read distance/color</button>
+            <button class="ctl" id="liveBtn" disabled title="Toggle: continuously stream ultrasonic + color every 250ms until turned off">◉ Read distance/color: OFF</button>
             <button class="ctl" data-cmd="SENSORS" disabled title="Snapshot line sensors">⟳ Line sensors</button>
-          </div>
-          <div class="ctl-row">
-            <button class="ctl" id="liveBtn" disabled title="Stream ultrasonic + color every 250ms for sensor testing">◉ Live readings: OFF</button>
           </div>
           <div class="ctl-row">
             <button class="ctl" data-cmd="RESET" disabled title="Reset grid coordinates to home">⌂ Reset coords</button>
@@ -695,7 +692,7 @@
     liveStreaming = on;
     const btn = $("liveBtn"), tag = $("liveTag");
     btn.classList.toggle("live-on", on);
-    btn.textContent = on ? "◉ Live readings: ON" : "◉ Live readings: OFF";
+    btn.textContent = on ? "◉ Read distance/color: ON" : "◉ Read distance/color: OFF";
     tag.classList.toggle("streaming", on);
     tag.textContent = on ? "streaming" : "idle";
   }

@@ -51,7 +51,16 @@ BridgePrint Bridge;
 #define COLOR_S2_PIN 7
 #define COLOR_S3_PIN 6
 #define COLOR_OUT_PIN 8
-#define IR_RECEIVE_PIN A3 
+#define IR_RECEIVE_PIN A3
+
+// Optional: many TCS3200 modules have 4 white illumination LEDs wired straight
+// to VCC, so they burn ~20-60mA continuously whenever the board is powered and
+// nothing in software can turn them off. If your module instead breaks the LED
+// enable out to a pin (often labelled "LED"), wire it to a spare Uno GPIO and
+// define it here — then SLEEP/IDLE will drive it LOW to cut the LEDs, and a
+// colour read drives it back HIGH. Leave this commented out if the LEDs are
+// hardwired to power (only a physical switch/MOSFET can cut them then).
+// #define COLOR_LED_PIN 2   // example: wire the module's LED pin to Uno D2
 
 // ── Motor Speed References from Library ────────────────────────
 extern uint8_t speed_Upper_L;
@@ -88,15 +97,20 @@ int currentHeading = WEST;
 // The playable area is a 6×6 collecting grid (junction nodes 0..6) plus a 3×2
 // START zone extending east of its right edge (nodes X 6..9, Y 2..4), home at
 // (7,3). The car must NOT drive onto the outermost line on any side — it stays
-// one node in from every edge. Tracked node is clamped to X 1..8, Y 1..5:
+// one node in from every edge. Tracked node is clamped to X 1..9, Y 1..5:
 // X=1 = block column; the car only drives as far as X=2 (one node east) to read
 // colour and grab, letting the ultrasonic creep the last bit so it never clashes
-// with the block on X=1. X=8 keeps it one in from the START zone's east edge
-// (X9); Y 1..5 is one in from the
+// with the block on X=1. X=9 is the START zone's east edge, where the block is
+// dropped; Y 1..5 is one in from the
 // collecting top/bottom. moveCoord() clamps every target so the car can never
 // be commanded onto or past the outer boundary line.
-const int GRID_MIN_X = 1, GRID_MAX_X = 8;
+const int GRID_MIN_X = 1, GRID_MAX_X = 9;
 const int GRID_MIN_Y = 1, GRID_MAX_Y = 5;
+// Drop point: the car releases the block at (9,3), the east edge of the
+// coordinate-tracked collecting grid (GRID_MAX_X=9), two nodes EAST of home
+// (7,3) on row 3. goToDrop() line-follows east from home and counts junctions,
+// tracking currentX, until it reaches column 9 — where it stops and releases.
+const int DROP_TARGET_X = 9;
 
 // Emit the tracked pose over both serial links so the dashboard's live map can
 // draw the robot. Format: "[POS] x,y,h" with h = 0..3 (NORTH/EAST/SOUTH/WEST).
@@ -181,8 +195,17 @@ const int ITEM_DETECT_DISTANCE_CM = 25;
 // with the block (and the colour read is taken here too, so it must not ram it).
 // Empirical — tune on the real car: too large and the closing claw misses the
 // block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm.
-// Lowered to 8cm so the car noses slightly closer to the block before gripping.
+// Calibrated on the car: ~7cm gives a reliable colour read; 6cm COLLIDES with the
+// block. Stop at 8cm so ultrasonic jitter + the final creep still leave the car
+// safely short of the 6cm collision point while sitting close enough (~7-8cm) for
+// an accurate colour read and grip. Do NOT lower toward 6.
 const int GRAB_APPROACH_DISTANCE_CM = 8;
+// Colour is only TRUSTED for the grab/search DECISION when the block is this close
+// (the ~7cm calibrated read distance, plus margin). The raw sensor still reads at
+// any distance for the live bench, but grabColorIfMatch ignores far reads — beyond
+// this range the sensor sees the floor and false-positives BLUE, which would make
+// the search reject the right block or grab the wrong one.
+const int COLOR_DECISION_DISTANCE_CM = 10;
 // Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
 // still used by the scripted paths' floor). Lets a caller start slower than
 // SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
@@ -200,28 +223,68 @@ const int GRAB_APPROACH_DISTANCE_CM = 8;
 // slow enough that any residual line-follow correction can straighten it before
 // it reaches the grab distance and stops.
 const uint8_t APPROACH_SPEED_FLOOR = 34;
+// Max PWM change per approach tick (~60ms). The approach speed is derived from
+// the raw ultrasonic distance, which jitters a few cm between pings, so the
+// target speed bounces up and down every tick. Sending those raw jumps straight
+// to the motors makes the car stutter as it nears the block. Instead we ease the
+// commanded speed toward the target by at most this much per tick, so both the
+// distance-based ramp-down and any sensor jitter come out as a smooth glide.
+// 2/tick over the ~34..48 approach range settles in well under a second. Raise
+// for a snappier (but jerkier) response; lower for an even smoother crawl.
+// Lowered from 2 to 1: with the tighter tick below the loop runs often enough
+// that 1 PWM/tick still tracks the ramp, and the smaller steps mean the motors
+// never feel a speed jump — the crawl comes out glassy instead of pulsing.
+const uint8_t APPROACH_SPEED_SLEW = 1;
+// Control-loop period for the block approach. Was a bare 60ms, but each tick also
+// blocked on a full colour read (9 pulseIn calls, up to ~0.3s of *variable* stall)
+// plus two ultrasonic pings, so the real period lurched and the motors stuttered.
+// With the colour read gated to debug-only and a single ping per tick (see
+// executeApproachMovement), the loop is now light enough to run every 40ms — more
+// frequent line-follow corrections and speed slews mean a smoother, straighter
+// crawl onto the block. Lower for even tighter control; the ultrasonic ping itself
+// takes up to ~30ms, so going much below this leaves little settle margin.
+const unsigned long APPROACH_TICK_MS = 40;
 const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 // pulseIn timeout for one color-sensor channel read (microseconds).
 const unsigned long COLOR_PULSE_TIMEOUT_US = 30000UL;
-// The colour sensor only reads the BLOCK reliably when the car is nosed right up
-// to it. Farther out, its wide field of view sees the floor/mat and ambient
-// light instead, and the pulse-width comparison tends to fall to BLUE (smallest
-// channel) even in front of a RED block. So a colour read is only TRUSTED within
-// this distance; beyond it gridDetectColorValue() returns ANY ("unknown") so a
-// far floor reflection can't be mistaken for a real block colour. Keep this at or
-// below GRAB_APPROACH_DISTANCE_CM (the standoff where the real read/grab happens);
-// a hair above it (10) gives a little margin for ultrasonic jitter right at the
-// stop. Tune on the car: raise if valid close reads get rejected, lower if far
-// false colours still leak through.
-const int COLOR_RELIABLE_DISTANCE_CM = 10;
 // Tracks the claw's last commanded angle so the LEFT/RIGHT arrow nudge
 // buttons can step from wherever it currently sits, rather than jumping to
 // an extreme. Kept in sync by openClawWithAttach()/closeClawGrip()/clawNudge().
 uint8_t clawCurrentAngle = CLAW_OPEN_ANGLE;
-const uint8_t SPEED_REVERSE_BUMP = 60; 
-const unsigned long REVERSE_BUMP_MS = 100; 
-const int CMD_STAR = 0x42; 
+const uint8_t SPEED_REVERSE_BUMP = 60;
+const unsigned long REVERSE_BUMP_MS = 100;
+// goToDrop() drives out to the X=9 drop line at the normal smooth crawl and then
+// fires this reverse-brake pulse the instant X=9 is counted, so the car settles
+// dead on (9,3) instead of coasting past it. Long enough to clear the H-bridge
+// direction dead-time and actually bite, not just idle. Raise it if the car
+// still rolls past X=9; lower it if it jerks backward off the line.
+const unsigned long DROP_BRAKE_MS = 130;
+// After counting the X=9 drop line, creep a little further FORWARD into the drop
+// area before stopping, so the block is set down inside the zone rather than right
+// on its edge. Runs at the gentle PATH_APPROACH_SPEED crawl. This replaces the old
+// reverse-brake (which pulled the car back onto the line); raise for a deeper push
+// into the zone, lower it — or set to 0 — to stop closer to the X=9 line.
+const unsigned long DROP_FORWARD_NUDGE_MS = 250;
+// Final alignment settle: once the drop line is reached, goToDrop() runs a brief
+// in-place line-centering phase BEFORE the forward nudge. It only STEERS to square
+// the chassis onto the line (corrections fire, but it never advances straight),
+// so a car that arrived slightly skewed straightens out and the block is released
+// dead-straight instead of at an angle. Runs for this long or until the car reads
+// centered (L/R both off the line) for a couple of consecutive ticks, whichever
+// comes first. Raise it if the car still releases crooked; lower it — or set to 0
+// to skip the settle — if it wastes time wiggling once already straight.
+const unsigned long DROP_ALIGN_SETTLE_MS = 600;
+// Reverse distance after releasing the block at the drop zone, BEFORE the 180°
+// spin back toward home. The plain gridSlightReverse (REVERSE_BUMP_MS=100) left
+// the car too close and the spinning chassis clipped ("slashed") the block it had
+// just set down — especially now that DROP_FORWARD_NUDGE_MS pushes it deeper into
+// the zone first. This backs off far enough that the 180° turn swings clear.
+// Raise if the spin still catches the block; lower if it reverses too far to
+// re-acquire the home junction. moveCoord() on the return counts the junction
+// crossing, so a longer reverse here does NOT throw off where it lands.
+const unsigned long DROP_CLEAR_REVERSE_MS = 450;
+const int CMD_STAR = 0x42;
 
 // ── Forward Declarations ────────────────────────────────────────────────────
 int gridGetDistanceCm();
@@ -241,13 +304,18 @@ void printStatusTelemetry(int distance, int color) {
 
 // Read sensors and print a single consolidated telemetry line without
 // triggering the internal DBG prints from the individual read functions.
+// Forces sensors ON for the read so the live stream / test bench always shows
+// distance + colour, even when idle (navigation normally leaves sensors OFF).
 void telemetryReport() {
     if (emergencyStopActive) return;
     bool prevDebug = debugTelemetry;
-    debugTelemetry = false; // suppress internal DBG prints
+    bool prevSensors = sensorsEnabled;
+    debugTelemetry = false;   // suppress internal DBG prints
+    sensorsEnabled = true;    // always read on the bench, regardless of nav state
     int distance = gridGetDistanceCm();
     int color = gridDetectColorValue();
     debugTelemetry = prevDebug;
+    sensorsEnabled = prevSensors;
 
     Bridge.print(F("[AUTO] "));
     printStatusTelemetry(distance, color);
@@ -316,6 +384,31 @@ void spinLeftInPlace(uint8_t speed) { gridSetSpeed(speed); mecCar.Turn_Left(); }
 void disableSensors() {
     sensorsEnabled = false;
     Bridge.println(F("[SYSTEM] Ultrasonic and Color sensors have been SOFTWARE DISABLED."));
+}
+
+// Low-power idle: cut every draw the firmware CAN control while the car sits
+// doing nothing. Motors coast (Stop = 0 PWM), the ultrasonic stops pinging
+// (sensorsEnabled=false), the 1 s telemetry ping+colour read stops
+// (debugTelemetry=false), the claw servo is detached so it isn't held under
+// current, and the TCS3200 colour sensor is put into power-down (S0=LOW/S1=LOW)
+// — which, if the module's LED enable is wired to COLOR_LED_PIN, also kills its
+// illumination LEDs. Everything wakes automatically on the next command: the
+// next colour read calls colorSensorWake() to restore the sensor. This does NOT
+// touch the ESP32 WiFi radio (the single biggest draw) — that lives on the other
+// board and can only be quieted from the ESP32 firmware or a power switch.
+void enterIdleSleep() {
+    gridStop();                 // coast the motors (already 0 PWM, but be explicit)
+    sensorsEnabled = false;     // stop the ultrasonic ever being pinged while idle
+    debugTelemetry = false;     // stop the periodic ping + full colour read
+    clawServo.detach();         // ensure the servo isn't holding position under load
+    // Power down the colour sensor: S0=LOW,S1=LOW = TCS3200 power-down mode.
+    digitalWrite(COLOR_S0_PIN, LOW);
+    digitalWrite(COLOR_S1_PIN, LOW);
+#ifdef COLOR_LED_PIN
+    digitalWrite(COLOR_LED_PIN, LOW);   // cut the module LEDs if wired to a GPIO
+#endif
+    Bridge.println(F("[SYSTEM] IDLE — motors coasted, colour sensor powered down, "
+                     "telemetry off. Send any command (or press a remote button) to wake."));
 }
 
 // Peek at either serial link for a dashboard STOP without consuming a full
@@ -598,29 +691,51 @@ unsigned long gridReadColorChannel(bool s2, bool s3) {
 // actual numbers are visible for tuning without enabling full telemetry spam.
 bool logColorRaw = false;
 
+// Restore the TCS3200 to its normal running configuration: S0=HIGH/S1=LOW =
+// 100% frequency scaling (the active mode setup() leaves it in). SLEEP puts the
+// sensor into power-down (S0=LOW/S1=LOW), so every colour read calls this first
+// to self-heal — the sensor wakes on the next read with no explicit re-arm. Also
+// re-lights the module LEDs if their enable is wired to COLOR_LED_PIN.
+void colorSensorWake() {
+    digitalWrite(COLOR_S0_PIN, HIGH);
+    digitalWrite(COLOR_S1_PIN, LOW);
+#ifdef COLOR_LED_PIN
+    digitalWrite(COLOR_LED_PIN, HIGH);
+#endif
+}
+
 int gridDetectColorValue() {
-    if (!sensorsEnabled || emergencyStopActive) return ANY;
-    // Distance gate: the sensor only reads the block (not the floor) when it's
-    // close. Beyond COLOR_RELIABLE_DISTANCE_CM, return ANY instead of a bogus
-    // far reading (which tends to false-positive BLUE). distance <= 0 means the
-    // ultrasonic returned no echo — also untrusted.
-    int distance = gridGetDistanceCm();
-    if (distance <= 0 || distance > COLOR_RELIABLE_DISTANCE_CM) {
-        if (debugTelemetry || logColorRaw) {
-            Bridge.print(F("[DBG] Color skipped — distance "));
-            Bridge.print(distance);
-            Bridge.println(F("cm out of reliable range -> ANY"));
-        }
-        return ANY;
-    }
+    if (emergencyStopActive) return ANY;
+    colorSensorWake();   // self-heal from a prior SLEEP power-down before reading
     unsigned long red = gridReadColorChannel(LOW, LOW);
     unsigned long green = gridReadColorChannel(HIGH, HIGH);
     unsigned long blue = gridReadColorChannel(LOW, HIGH);
 
+    // Classify by which channel is MOST reflected (smallest pulse width), with a
+    // green-vs-blue tiebreak that separates RED from YELLOW. Both RED and YELLOW
+    // reflect red strongest (red channel smallest for both), so "smallest wins"
+    // alone can't tell them apart — the LEAST-reflected channel is what does.
+    //
+    // Calibrated on the car with each block held at ~5-6cm (see CAL command):
+    //   RED    R=1007 G=1249 B=1061  -> red most reflected, GREEN least (blue<green)
+    //   YELLOW R=789  G=892  B=976   -> red most reflected, BLUE least  (green<blue)
+    //   BLUE   R=1245 G=1238 B=982   -> blue most reflected
+    // Past ~7cm the signal weakens and the three channels bunch to within a few
+    // percent (red/yellow then collapse to blue) — reads MUST be taken close for
+    // this to hold. See COLOR_DECISION_DISTANCE_CM and the grab standoff.
     int result = ANY;
-    if (blue < red && blue < green) result = BLUE;
-    else if (red < blue && green < blue && red < green * 1.4 && green < red * 1.4) result = YELLOW;
-    else if (red < green && red < blue) result = RED;
+    if (blue < red && blue < green) {
+        result = BLUE;                          // blue most reflected
+    } else if (red < blue || red < green) {
+        // Red strongly reflected -> RED or YELLOW. A raw blue<green compare has
+        // too thin a margin and FLIPS on yellow past ~6cm (yellow's green/blue
+        // cross over), so use the green/blue RATIO instead, which stays separated:
+        //   RED    G/B ~1.16-1.18 (green far less reflected than blue)
+        //   YELLOW G/B ~0.83 (close) .. ~1.09 (at 8cm) — never reaches RED's band
+        // Threshold 1.12 splits every calibration sample, incl. yellow at 7-8cm.
+        result = (green > blue * 1.12f) ? RED : YELLOW;
+    }
+    // else: green somehow most reflected -> not a target color, leave as ANY.
 
     if (debugTelemetry || logColorRaw) {
         Bridge.print(F("[DBG] Color raw R=")); Bridge.print(red);
@@ -655,6 +770,58 @@ const char *gridColorName(int color) {
     if (color == BLUE) return "BLUE";
     if (color == YELLOW) return "YELLOW";
     return "ANY / OTHERS";
+}
+
+// Calibration helper: hold ONE colored block at the target read distance, then
+// send "CAL" (dashboard or serial). It averages many raw R/G/B pulse-width
+// samples for a stable reading and prints them alongside the current ultrasonic
+// distance (so you can confirm the standoff) and the normalized R/G/B ratios.
+//
+// Capture RED, YELLOW and BLUE this way, note the numbers, and feed them back so
+// the thresholds in gridDetectColorValue() can be set to those measured values.
+// Raw pulse width is INVERSELY proportional to how much of that color is present:
+// a SMALLER number for a channel means MORE of that color. Normalized ratios make
+// the read distance-tolerant — absolute pulse widths shift with distance/lighting,
+// but the ratio between channels stays roughly constant for a given color.
+void gridCalibrateColorReport() {
+    colorSensorWake();
+    const int CAL_SAMPLES = 15;
+    unsigned long redSum = 0, greenSum = 0, blueSum = 0;
+    for (int i = 0; i < CAL_SAMPLES; i++) {
+        redSum   += gridReadColorChannel(LOW, LOW);
+        greenSum += gridReadColorChannel(HIGH, HIGH);
+        blueSum  += gridReadColorChannel(LOW, HIGH);
+    }
+    unsigned long red = redSum / CAL_SAMPLES;
+    unsigned long green = greenSum / CAL_SAMPLES;
+    unsigned long blue = blueSum / CAL_SAMPLES;
+
+    // Convert pulse widths to "strength" (inverse), then normalize to percentages
+    // so the three add up to ~100. Larger % = more of that color reflected.
+    float rInv = red   > 0 ? 1000.0f / red   : 0;
+    float gInv = green > 0 ? 1000.0f / green : 0;
+    float bInv = blue  > 0 ? 1000.0f / blue  : 0;
+    float invTotal = rInv + gInv + bInv;
+    int rPct = invTotal > 0 ? (int)(rInv / invTotal * 100.0f + 0.5f) : 0;
+    int gPct = invTotal > 0 ? (int)(gInv / invTotal * 100.0f + 0.5f) : 0;
+    int bPct = invTotal > 0 ? (int)(bInv / invTotal * 100.0f + 0.5f) : 0;
+
+    int distance = gridGetDistanceCm();
+
+    Bridge.println(F("[CAL] ---- color calibration sample ----"));
+    Bridge.print(F("[CAL] distance: ")); Bridge.print(distance);
+    Bridge.println(F(" cm  (confirm this matches your target read distance)"));
+    Bridge.print(F("[CAL] raw pulse width  R=")); Bridge.print(red);
+    Bridge.print(F(" G=")); Bridge.print(green);
+    Bridge.print(F(" B=")); Bridge.print(blue);
+    Bridge.println(F("  (smaller = more of that color)"));
+    Bridge.print(F("[CAL] normalized %     R=")); Bridge.print(rPct);
+    Bridge.print(F(" G=")); Bridge.print(gPct);
+    Bridge.print(F(" B=")); Bridge.print(bPct);
+    Bridge.println(F("  (larger = more of that color)"));
+    Bridge.print(F("[CAL] current classifier says: "));
+    Bridge.println(gridColorName(gridDetectColorValue()));
+    Bridge.println(F("[CAL] -----------------------------------"));
 }
 
 void openClawWithAttach() {
@@ -733,6 +900,21 @@ void closeClawGrip() {
 // return value to decide whether to keep searching the other blocks.
 bool grabColorIfMatch(int color) {
     if (emergencyStopActive) return false;
+
+    // Only DECIDE on colour when the block is actually close (~7cm calibrated read
+    // distance, within COLOR_DECISION_DISTANCE_CM). Farther out the sensor reads
+    // the floor and false-positives BLUE, which would grab the wrong block or make
+    // the search reject the right one. If we're not close, the block isn't in
+    // grabbing range anyway — report no match so the caller keeps approaching/
+    // searching rather than gripping on a bogus read.
+    int distance = gridGetDistanceCm();
+    if (distance <= 0 || distance > COLOR_DECISION_DISTANCE_CM) {
+        Bridge.print(F("[GRAB] Too far for a trusted colour read (distance "));
+        Bridge.print(distance);
+        Bridge.println(F("cm) — skipping grip."));
+        return false;
+    }
+
     logColorRaw = true;                    // show raw R/G/B for each vote read
     int detected = gridDetectColorMajority();
     logColorRaw = false;
@@ -740,7 +922,10 @@ bool grabColorIfMatch(int color) {
     Bridge.print(F("[GRAB] target="));
     Bridge.print(gridColorName(color));
     Bridge.print(F(" detected="));
-    Bridge.println(gridColorName(detected));
+    Bridge.print(gridColorName(detected));
+    Bridge.print(F(" @ "));
+    Bridge.print(distance);
+    Bridge.println(F("cm"));
 
     if (detected == color || color == ANY) {
         closeClawGrip();
@@ -766,29 +951,67 @@ bool isGrabTargetReached(int currentDistance) {
 // SPEED_MIN (their original default) keep SPEED_MIN as the floor, unchanged.
 // A caller starting below SPEED_MIN (e.g. the UP button's 40) instead floors
 // at APPROACH_SPEED_FLOOR, so it still has real room to taper down further.
-void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
-    if (emergencyStopActive) return;
+// Returns true if it stopped because a block is in grab range, false if it
+// reached the column-1 junction (all line sensors HIGH) WITHOUT finding a block.
+// The block is ALWAYS at column 1, so if the car creeps all the way to that
+// junction with nothing in ultrasonic range, there is no block here — stop
+// instead of driving forward off the grid, and let the caller search elsewhere.
+bool executeApproachMovement(int currentDistance, uint8_t startSpeed) {
+    if (emergencyStopActive) return false;
     unsigned long telemetryTickMillis = millis();
     uint8_t floorSpeed = (startSpeed < SPEED_MIN) ? min(APPROACH_SPEED_FLOOR, startSpeed) : SPEED_MIN;
+    // Running commanded speed, slewed toward the distance-derived target each tick
+    // so the car glides in instead of stuttering on ultrasonic jitter. Seeded at
+    // startSpeed since that's what the very first (far) tick would command anyway.
+    uint8_t smoothedSpeed = startSpeed;
 
     while (!isGrabTargetReached(currentDistance)) {
-        if (checkEmergencyStop()) return;
-        int color = gridDetectColorValue();
+        if (checkEmergencyStop()) return false;
+        // One ultrasonic ping per tick drives BOTH the speed ramp and the loop
+        // exit test. Do NOT read the colour sensor here: a full colour read is
+        // 9 blocking pulseIn calls (up to ~0.3s of *variable* stall) and the
+        // approach only needs distance — reading it every tick made the loop
+        // period lurch and the motors stutter. Colour is decided later in
+        // grabColorIfMatch; here we only sample it for the telemetry line when
+        // debug output is actually on.
         int distance = gridGetDistanceCm();
+        currentDistance = distance;
         if (debugTelemetry) {
             Bridge.print(F("[APPROACH] "));
-            printStatusTelemetry(distance, color);
+            printStatusTelemetry(distance, gridDetectColorValue());
         }
 
-        uint8_t approachSpeed = startSpeed;
+        // Boundary guard: the block is always at column 1. If the car has crept
+        // to the column-1 junction (all three line sensors HIGH) and the
+        // ultrasonic still sees no block in range, there is no block on this row —
+        // stop here rather than driving forward past column 1 and off the grid.
+        if (digitalRead(LINE_LEFT_PIN) == HIGH &&
+            digitalRead(LINE_CENTER_PIN) == HIGH &&
+            digitalRead(LINE_RIGHT_PIN) == HIGH) {
+            gridStop();
+            Bridge.println(F("[APPROACH] Reached column-1 junction with no block — stopping (no block here)."));
+            return false;
+        }
+
+        uint8_t targetSpeed = startSpeed;
         if (distance > 0) {
             // Linearly ramp down from startSpeed at ITEM_DETECT_DISTANCE_CM
             // down to floorSpeed at GRAB_APPROACH_DISTANCE_CM.
             int span = ITEM_DETECT_DISTANCE_CM - GRAB_APPROACH_DISTANCE_CM;
             int clamped = constrain(distance, GRAB_APPROACH_DISTANCE_CM, ITEM_DETECT_DISTANCE_CM);
             int scaled = floorSpeed + (long)(startSpeed - floorSpeed) * (clamped - GRAB_APPROACH_DISTANCE_CM) / span;
-            approachSpeed = (uint8_t)constrain(scaled, floorSpeed, startSpeed);
+            targetSpeed = (uint8_t)constrain(scaled, floorSpeed, startSpeed);
         }
+
+        // Slew the commanded speed toward the target by at most APPROACH_SPEED_SLEW
+        // per tick, so ultrasonic jitter and the ramp-down both come out smooth
+        // instead of the motors snapping to a new PWM every 60ms.
+        if (targetSpeed > smoothedSpeed) {
+            smoothedSpeed = min((int)targetSpeed, smoothedSpeed + APPROACH_SPEED_SLEW);
+        } else if (targetSpeed < smoothedSpeed) {
+            smoothedSpeed = max((int)targetSpeed, smoothedSpeed - APPROACH_SPEED_SLEW);
+        }
+        uint8_t approachSpeed = smoothedSpeed;
 
         // Stay centered on the line while creeping toward the block — same
         // correction branches as the line-follow functions. Without this the
@@ -809,11 +1032,11 @@ void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
             gridSetSpeed(approachSpeed);
             mecCar.Advance();
         }
-        delay(60);
-        currentDistance = gridGetDistanceCm();
+        delay(APPROACH_TICK_MS);
         motionTelemetryTick(telemetryTickMillis);
     }
     gridStop();
+    return true;   // exited the loop because a block is within grab range
 }
 
 // Rotates in place until currentHeading matches targetHeading, always
@@ -888,8 +1111,14 @@ void moveCoord(int targetX, int targetY) {
 bool moveToGrab(int targetColour, uint8_t approachStartSpeed = SPEED_MIN) {
     if (checkEmergencyStop()) return false;
     int distance = gridGetDistanceCm();
-    executeApproachMovement(distance, approachStartSpeed);
+    bool blockFound = executeApproachMovement(distance, approachStartSpeed);
     if (emergencyStopActive) return false;
+    // No block on this row (car stopped at the column-1 junction) — don't try to
+    // grip, just report no-grab so the caller (search) moves to the next block.
+    if (!blockFound) {
+        Bridge.println(F("[GRAB] No block found on this row — skipping grip."));
+        return false;
+    }
     return grabColorIfMatch(targetColour);
 }
 
@@ -902,37 +1131,115 @@ void moveHome() {
     gridStop();
 }
 
+// Line-follow EAST from home out to the drop point (9,3) and stop, ready to
+// release. Uses the SLOW approach speed (same crawl as the block grab) with the
+// same line-centering correction, so the car straightens onto the line before it
+// stops — the block is released dead-straight rather than skewed. Tracks currentX
+// as it crosses junctions and stops the instant it reaches DROP_TARGET_X (9).
+// Assumes it starts on home (7,3) facing EAST (moveHome / carryHomeViaRow3 leave
+// it there).
 void goToDrop() {
     if (checkEmergencyStop()) return;
-    int junctionsEncountered = 0;
-    bool activeJunctionFlag = true;
+    bool activeJunctionFlag = true;   // debounce: only count a junction on its leading edge
     unsigned long lineLostSince = 0;
-    gridSetSpeed(SPEED_START_FAST);
 
-    while (junctionsEncountered < 4) {
+    while (currentX < DROP_TARGET_X) {
         if (checkEmergencyStop()) return;
         if (checkOffGridStop(lineLostSince)) return;
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
 
+        // Line-follow with the SAME crawl speed, correction boost and tick as the
+        // proven block-grab approach, so the drive out to the drop point tracks
+        // the line just as smoothly. A single consistent speed keeps the steer
+        // differential gentle (no weaving), and the reverse-brake below — not a
+        // slower crawl — is what nails the precise stop on the X=9 line.
         if (Left == HIGH && Center == HIGH && Right == HIGH) {
+            // Junction cross — count one coordinate step east on its leading edge.
             if (!activeJunctionFlag) {
-                junctionsEncountered++;
                 activeJunctionFlag = true;
-                if (junctionsEncountered == 4) break;
+                currentX += 1;
+                reportPosition();
+                if (currentX >= DROP_TARGET_X) break;   // reached (9,3)
             }
-            mecCar.Advance();
+            gridSetSpeed(PATH_APPROACH_SPEED); mecCar.Advance();
         } else if (Left == LOW && Center == HIGH && Right == LOW) {
-            activeJunctionFlag = false; mecCar.Advance();
+            activeJunctionFlag = false;
+            gridSetSpeed(PATH_APPROACH_SPEED); mecCar.Advance();
+        } else if (Left == LOW && Center == LOW && Right == HIGH) {
+            activeJunctionFlag = false;
+            gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, false);
+        } else if (Left == HIGH && Center == LOW && Right == LOW) {
+            activeJunctionFlag = false;
+            gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, true);
         } else if (Right == HIGH) {
-            activeJunctionFlag = false; mecCar.Turn_Right();
+            activeJunctionFlag = false;
+            gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, false);
         } else if (Left == HIGH) {
-            activeJunctionFlag = false; mecCar.Turn_Left();
-        } else { mecCar.Advance(); }
+            activeJunctionFlag = false;
+            gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, true);
+        } else {
+            gridSetSpeed(PATH_APPROACH_SPEED); mecCar.Advance();
+        }
+        delay(40);   // slightly finer than the 60 ms grab tick so corrections fire
+                     // more often on the straight run — smoother line tracking.
     }
-    mecCar.Stop();
-    if (!emergencyStopActive) Bridge.println(F("[SYSTEM] Drop zone reached. Stopped instantly."));
+    // Final alignment settle: square the chassis onto the drop mark BEFORE moving
+    // in to release. The drive-out crawl can arrive a touch skewed (near the stall
+    // floor there isn't much correction authority per tick), which sets the block
+    // down at an angle. Here we STEER-only — the outer side nudges the car back
+    // toward centre while the base crawl speed keeps it from running forward much.
+    //
+    // The X=9 drop mark is a WIDE band, so "centred" is NOT "both edges off the
+    // line" — on a wide mark the outer L/R sensors sit ON the band and read HIGH.
+    // Squared-up is the SYMMETRIC state: L and R AGREE (both HIGH = sitting square
+    // on the wide band, or both LOW = clear of it). We only steer when they
+    // DISAGREE (one edge on the mark, the other off = the chassis is skewed), and
+    // count as aligned once they agree for two consecutive ticks. This works for a
+    // thin line too (there L==R==LOW is the centred state). Fine 25 ms tick so the
+    // squaring is quick and doesn't overshoot into a weave.
+    if (!emergencyStopActive && DROP_ALIGN_SETTLE_MS > 0) {
+        unsigned long settleStart = millis();
+        uint8_t alignedTicks = 0;
+        while (millis() - settleStart < DROP_ALIGN_SETTLE_MS) {
+            if (checkEmergencyStop()) return;
+            uint8_t Left = digitalRead(LINE_LEFT_PIN);
+            uint8_t Right = digitalRead(LINE_RIGHT_PIN);
+            if (Left == Right) {
+                // Edges agree → chassis is square on (or clear of) the wide band.
+                // Confirm over two ticks so a momentary reading doesn't end early.
+                gridStop();
+                if (++alignedTicks >= 2) break;
+            } else if (Right == HIGH) {
+                // Right edge on the mark, left off → skewed; arc right to square up.
+                alignedTicks = 0;
+                gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, false);
+            } else {
+                // Left edge on the mark, right off → arc left to square up.
+                alignedTicks = 0;
+                gridSteer(PATH_APPROACH_SPEED, APPROACH_CORRECTION_BOOST, true);
+            }
+            delay(25);
+        }
+        gridStop();
+    }
+    // Nudge a little further FORWARD into the drop area before stopping, so the
+    // block is released inside the zone instead of right on the X=9 edge. Keep the
+    // gentle crawl speed so it eases in straight and the momentum stays low enough
+    // that a passive stop settles it without coasting far past the target.
+    if (!emergencyStopActive && DROP_FORWARD_NUDGE_MS > 0) {
+        gridSetSpeed(PATH_APPROACH_SPEED);
+        mecCar.Advance();
+        unsigned long nudgeStart = millis();
+        while (millis() - nudgeStart < DROP_FORWARD_NUDGE_MS) { if (checkEmergencyStop()) break; }
+    }
+    gridStop();
+    if (!emergencyStopActive) {
+        Bridge.print(F("[SYSTEM] Drop point (9,3) reached at column "));
+        Bridge.print(currentX);
+        Bridge.println(F(" — stopped, ready to release."));
+    }
 }
 
 void resetCoordinates() {
@@ -940,6 +1247,34 @@ void resetCoordinates() {
     emergencyStopActive = false;
     Bridge.println(F("[SYSTEM] Navigation Tracker Reset to Default Home Baseline (7,3) facing WEST."));
     reportPosition();
+}
+
+// Called once the car is sitting on the drop line at (9,3) facing EAST (right
+// after goToDrop()). Releases the carried block, backs off a little so the 180°
+// spin clears the block it just set down, turns to face WEST, then line-follows
+// one node back onto home (7,3). The return leg uses moveCoord(), which counts
+// the junction crossing rather than dead-reckoning distance, so the earlier
+// reverse bump doesn't throw off where it lands. Leaves the tracker reset to the
+// home baseline (7,3) facing WEST, ready for the next mission.
+void releaseAndReturnHome() {
+    if (checkEmergencyStop()) return;
+    delay(300);
+    openClawWithAttach();          // release the carried block at (9,3)
+    delay(300);
+    // Back off farther than the plain slight-reverse so the 180° spin swings fully
+    // clear of the block just released (the short bump let the chassis clip it).
+    gridSetSpeed(SPEED_REVERSE_BUMP);
+    mecCar.Back();
+    unsigned long clearStart = millis();
+    while (millis() - clearStart < DROP_CLEAR_REVERSE_MS) { if (checkEmergencyStop()) return; }
+    gridStop();
+    if (emergencyStopActive) return;
+    Bridge.println(F("[RETURN] Released — spinning 180 and heading back to home (7,3)."));
+    turnToHeading(WEST);           // 180° spin from EAST to face back toward home
+    if (emergencyStopActive) return;
+    moveCoord(7, 3);               // line-follow west one node onto home (7,3)
+    if (emergencyStopActive) return;
+    resetCoordinates();            // re-seed the home baseline (7,3) facing WEST
 }
 
 // ── Color-search across the 3 blocks ─────────────────────────────────────────
@@ -964,6 +1299,15 @@ const uint8_t SEARCH_APPROACH_SPEED = PATH_APPROACH_SPEED;
 // enough to guarantee we're back on the junction — reverse until we see it.
 static void backOffBlock() {
     if (checkEmergencyStop()) return;
+    // If we're already sitting on the junction (the no-block case: the approach
+    // stopped the car right on the column-1 junction), we're already at a known
+    // node — don't reverse, or we'd drift one node east and desync the tracker.
+    if (digitalRead(LINE_LEFT_PIN) == HIGH &&
+        digitalRead(LINE_CENTER_PIN) == HIGH &&
+        digitalRead(LINE_RIGHT_PIN) == HIGH) {
+        Bridge.println(F("[SEARCH] Already on the grid node — no back-off needed."));
+        return;
+    }
     Bridge.println(F("[SEARCH] Reversing off block to re-acquire grid node..."));
     gridSetSpeed(SPEED_REVERSE_BUMP);
     mecCar.Back();
@@ -1040,14 +1384,15 @@ int searchAndGrab(int targetColour, int startRow) {
         Bridge.print(F("[SEARCH] Checking block at row "));
         Bridge.println(row);
 
-        // Route to the block via the X=3 corridor, then approach only as far as
+        // Route to the block via the X=4 corridor, then approach only as far as
         // column 2 (one node EAST of the block at column 1). moveCoord does its
-        // X move before its Y move, so going to (3,row) first pulls the car out
-        // to column 3 before it changes rows — inter-block travel stays on the
-        // clear X=3 corridor instead of running along the block column. The car
-        // then stops at column 2 and lets moveToGrab creep the last bit with the
-        // ultrasonic, so it never drives onto column 1 and clashes with the block.
-        moveCoord(3, row);
+        // X move before its Y move, so going to (4,row) first pulls the car out
+        // to column 4 before it changes rows — every reorientation turn happens
+        // at column 4, well clear of the block column, and inter-block travel
+        // stays on that corridor. The car then stops at column 2 and lets
+        // moveToGrab creep the last bit with the ultrasonic, so it never drives
+        // onto column 1 and clashes with the block.
+        moveCoord(4, row);
         if (emergencyStopActive) return -1;
         moveCoord(2, row);
         if (emergencyStopActive) return -1;
@@ -1065,8 +1410,21 @@ int searchAndGrab(int targetColour, int startRow) {
 
         // Wrong colour: back off and (if any remain) hop to the next block.
         Bridge.println(F("[SEARCH] Wrong colour — reversing to try next block."));
-        backOffBlock();
+        backOffBlock();                 // reverse to the (2,row) junction, still facing WEST
         if (emergencyStopActive) return -1;
+
+        // If another block remains, pull EAST back onto the X=4 corridor WHILE
+        // STILL FACING WEST (reverse, no turn). Without this the car sits at
+        // column 2 facing WEST, and the next moveCoord(4,row) needs it facing EAST
+        // to step up in X — turning WEST->EAST is a 180° spin. Reversing to column
+        // 4 first makes that X move zero, so the next hop is only a 90° row change
+        // and the reorientation turn stays at column 4. Two nodes: 2 -> 3 -> 4.
+        if (i < 2) {
+            reverseOneCoordEast();      // (2,row) -> (3,row), still WEST
+            if (emergencyStopActive) return -1;
+            reverseOneCoordEast();      // (3,row) -> (4,row), currentX now 4, still WEST
+            if (emergencyStopActive) return -1;
+        }
     }
 
     Bridge.println(F("[SEARCH] No matching block found — returning home."));
@@ -1148,9 +1506,7 @@ void searchGrabAndDrop(int targetColour, int startRow) {
     // avoiding a 180° turn except for a row-3 (path 2) block.
     carryHomeViaRow3();
     if (emergencyStopActive) return;
-    delay(300);
-    openClawWithAttach();          // release at the drop zone
-    resetCoordinates();
+    releaseAndReturnHome();        // release, back off, spin 180, drive home to (7,3)
 }
 
 // ── Array Based Instruction Execution ───────────────────────────────────────
@@ -1158,29 +1514,36 @@ enum Action { FWD, LFT, RGT, GRB, REV, DRP, GDR, DLY };
 struct Step { Action act; uint8_t arg; };
 
 const Step path1[] = {
-    {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
+    // First leg: on the real mat FWD 2 overshot to column 3; FWD 1 lands the first
+    // turn on column 5 (home col 7 -> 5) as intended.
+    {FWD, 1}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
     // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
     // straight line-follow run so the car re-centers after the RGT turn before the
     // ultrasonic creeps the last stretch onto the block at column 1.
     {FWD, 4}, {DLY, 3}, {GRB, ANY}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, {RGT, 0},
-    {DLY, 5}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
-    {REV, 2}
+    // Return leg ends at (3,3) facing EAST; GDR seeds that pose then slow-drops at (9,3).
+    // DRP then releases, backs off, spins 180 and drives home to (7,3).
+    {DLY, 5}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},{GDR, 3}, {DLY, 2},{DRP, 0}
 };
 
 const Step path2[] = {
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, 
-    {RGT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
-    {REV, 2}
+    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    // Return leg ends at (1,3) facing EAST; GDR seeds that pose then slow-drops at (9,3).
+    // DRP then releases, backs off, spins 180 and drives home to (7,3).
+    {RGT, 0}, {DLY, 3}, {GDR, 1}, {DLY, 2}, {DRP, 0}
 };
 //GDR was = 0
 const Step path3[] = {
-    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    // First leg: on the real mat FWD 2 overshot to column 3; FWD 1 lands the first
+    // turn on column 5 (home col 7 -> 5) as intended (mirror of path1).
+    {FWD, 1}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
     // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
     // straight line-follow run so the car re-centers after the LFT turn before the
     // ultrasonic creeps the last stretch onto the block at column 1 (mirror of path1).
     {FWD, 4}, {DLY, 3}, {GRB, ANY}, {LFT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},{LFT, 0},
-    {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
-    {REV, 2}
+    // Return leg ends at (3,3) facing EAST; GDR seeds that pose then slow-drops at (9,3).
+    // DRP then releases, backs off, spins 180 and drives home to (7,3).
+    {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},{GDR, 3}, {DLY, 2},{DRP, 0}
 };
 
 // Returns true if the next non-DLY step at or after index `from` is a GRB.
@@ -1213,9 +1576,18 @@ void runPath(const Step* path, int len, int targetColour) {
             case RGT: sensorsEnabled = false; gridRotateRight90(); break;
             case GRB: sensorsEnabled = true; moveToGrab(targetColour, PATH_APPROACH_SPEED); break;
             case REV: gridSlightReverse(); break;
-            case DRP: openClawWithAttach(); break;
+            case DRP: releaseAndReturnHome(); break;   // release, back off, spin 180, drive home to (7,3)
 
-            case GDR: goToDrop(); break;
+            case GDR:
+                // Scripted paths don't track coordinates during FWD/LFT/RGT, so
+                // seed the tracker to the known pre-drop pose before the coordinate
+                // drop: the car is on row 3 facing EAST, at the column given in arg
+                // (path1/path3 finish their return at column 3). goToDrop() then
+                // slow-approaches EAST and stops exactly at (9,3).
+                currentX = path[i].arg; currentY = 3; currentHeading = EAST;
+                reportPosition();
+                goToDrop();
+                break;
             case DLY: delay(path[i].arg * 100); break;
         }
         // Brief settling pause between steps so transitions aren't abrupt.
@@ -1235,9 +1607,7 @@ void executeAutoMission(int targetY, int color) {
     moveHome();
     goToDrop();
     if (emergencyStopActive) return;
-    delay(300);
-    openClawWithAttach();
-    resetCoordinates();
+    releaseAndReturnHome();        // release, back off, spin 180, drive home to (7,3)
 }
 
 // ── Serial Command Control (Dashboard Debugging) ─────────────────────────────
@@ -1281,6 +1651,15 @@ void handleSerialCommand() {
         return;
     }
 
+    // SLEEP/IDLE puts the car into the low-power idle state (motors coasted,
+    // colour sensor powered down, telemetry off). Handled before the auto
+    // re-arm below so it returns without falling through to sensorsEnabled=true.
+    if (verb == "SLEEP" || verb == "IDLE") {
+        enterIdleSleep();
+        Bridge.println(F("[ACK] SLEEP — idle low-power"));
+        return;
+    }
+
     // No separate re-arm step: any command other than STOP automatically clears
     // a prior stop and runs, matching the IR remote where any button press
     // resumes. (RESUME/ARM are still accepted as an explicit clear for any
@@ -1315,10 +1694,21 @@ void handleSerialCommand() {
         Bridge.println(F("[ACK] DRP open claw"));
         openClawWithAttach();
     } else if (verb == "PING") {                 // read sensors on demand
+        bool prevSensors = sensorsEnabled;
+        sensorsEnabled = true;                   // force a read regardless of nav state
         int distance = gridGetDistanceCm();
         int color = gridDetectColorValue();
+        sensorsEnabled = prevSensors;
         Bridge.println(F("[ACK] PING"));
         printStatusTelemetry(distance, color);
+    } else if (verb == "CAL") {                  // color calibration sample
+        // Hold ONE colored block at the target read distance, then send CAL.
+        // Prints averaged raw + normalized R/G/B for tuning the classifier.
+        bool prevSensors = sensorsEnabled;
+        sensorsEnabled = true;
+        Bridge.println(F("[ACK] CAL"));
+        gridCalibrateColorReport();
+        sensorsEnabled = prevSensors;
     } else if (verb == "SENSORS") {              // raw line-sensor snapshot
         Bridge.print(F("[ACK] SENSORS L="));
         Bridge.print(digitalRead(LINE_LEFT_PIN));
@@ -1379,6 +1769,10 @@ void setup() {
     pinMode(COLOR_OUT_PIN, INPUT);
     digitalWrite(COLOR_S0_PIN, HIGH);
     digitalWrite(COLOR_S1_PIN, LOW);
+#ifdef COLOR_LED_PIN
+    pinMode(COLOR_LED_PIN, OUTPUT);
+    digitalWrite(COLOR_LED_PIN, HIGH);   // module LEDs on for normal running
+#endif
 
     // Open the gripper as soon as power is up.
     openClawWithAttach();
