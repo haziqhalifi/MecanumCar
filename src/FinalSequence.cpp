@@ -161,15 +161,28 @@ const unsigned long STEP_TRANSITION_MS = 250;
 const unsigned long LINE_LOST_TIMEOUT_MS = 800;
 // Start speed for the scripted-path block approach. Kept below SPEED_MIN so the
 // approach creeps in noticeably slower and still tapers toward APPROACH_SPEED_FLOOR.
-const uint8_t PATH_APPROACH_SPEED = 42;
+// Lowered from 42: at the higher speed the car noses onto the block before its
+// line-follow correction has straightened it, so it arrives slightly skewed and
+// the claw can't grip. A slower approach gives the alignment time to settle.
+// Must stay strictly below SPEED_MIN (38) so executeApproachMovement's taper
+// engages (it only ramps toward APPROACH_SPEED_FLOOR when startSpeed < SPEED_MIN;
+// at exactly SPEED_MIN the floor becomes SPEED_MIN and the approach runs flat).
+// Lowered further from 37 to 35 (one notch above APPROACH_SPEED_FLOOR=34) so the
+// WHOLE approach — not just the final taper — is a slow crawl, giving the
+// line-follow correction the maximum distance to straighten the car onto the line
+// before it reaches the block and grabs. Do NOT go below ~34: that is near the
+// motors' stall/breakaway floor (see APPROACH_SPEED_FLOOR note) and the car would
+// buzz in place and stop short of the block instead of creeping onto it.
+const uint8_t PATH_APPROACH_SPEED = 35;
 const int ITEM_DETECT_DISTANCE_CM = 25;
 // Stop this far from the block to read colour and grab — leave a GAP rather than
 // nosing right up to it. The gripper jaws swing FORWARD as they close, so they
 // reach the block from this standoff; stopping closer makes the chassis collide
 // with the block (and the colour read is taken here too, so it must not ram it).
 // Empirical — tune on the real car: too large and the closing claw misses the
-// block, too small and the chassis bumps it. Was 6cm (nose-to-block).
-const int GRAB_APPROACH_DISTANCE_CM = 9;
+// block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm.
+// Lowered to 8cm so the car noses slightly closer to the block before gripping.
+const int GRAB_APPROACH_DISTANCE_CM = 8;
 // Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
 // still used by the scripted paths' floor). Lets a caller start slower than
 // SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
@@ -181,7 +194,12 @@ const int GRAB_APPROACH_DISTANCE_CM = 9;
 // this earlier caused it to stop short of the block. Keep this close to
 // SPEED_MIN so it still physically moves; it only needs to be slightly below
 // SPEED_MIN to give a *visible* taper, not a true crawl.
-const uint8_t APPROACH_SPEED_FLOOR = 38;
+// Lowered from 38 to 34 so the very last stretch onto the block is a genuine
+// crawl — this is where the car needs to be dead-straight for the claw to grip.
+// 34 is close to the stall floor (~35 crawl elsewhere) so it still creeps but is
+// slow enough that any residual line-follow correction can straighten it before
+// it reaches the grab distance and stops.
+const uint8_t APPROACH_SPEED_FLOOR = 34;
 const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 // pulseIn timeout for one color-sensor channel read (microseconds).
@@ -1097,7 +1115,10 @@ struct Step { Action act; uint8_t arg; };
 
 const Step path1[] = {
     {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
-    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, {RGT, 0}, 
+    // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
+    // straight line-follow run so the car re-centers after the RGT turn before the
+    // ultrasonic creeps the last stretch onto the block at column 1.
+    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, {RGT, 0},
     {DLY, 5}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
     {REV, 2}
 };
@@ -1109,8 +1130,11 @@ const Step path2[] = {
 };
 //GDR was = 0
 const Step path3[] = {
-    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, 
-    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {LFT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},{LFT, 0}, 
+    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
+    // straight line-follow run so the car re-centers after the LFT turn before the
+    // ultrasonic creeps the last stretch onto the block at column 1 (mirror of path1).
+    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {LFT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},{LFT, 0},
     {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
     {REV, 2}
 };
