@@ -118,19 +118,22 @@ void setup() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
-  // Serve the gzip-compressed dashboard from PROGMEM. Answer both GET (browsers)
-  // and HEAD (health checkers / `curl -I`) so a HEAD probe doesn't 404.
-  server.on("/", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
-    AsyncWebServerResponse *res = req->beginResponse_P(
-        200, "text/html; charset=utf-8", DASHBOARD_HTML_GZ, DASHBOARD_HTML_GZ_LEN);
-    res->addHeader("Content-Encoding", "gzip");
-    req->send(res);
-  });
-
-  // Demo-day showcase view — same telemetry, story-driven presentation.
-  server.on("/showcase", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
+  // Client-facing showcase is the DEFAULT interface at "/": the story-driven
+  // presentation view anyone opening the robot's IP should land on. Answer both
+  // GET (browsers) and HEAD (health checkers / `curl -I`) so a HEAD probe 200s.
+  auto sendShowcase = [](AsyncWebServerRequest *req) {
     AsyncWebServerResponse *res = req->beginResponse_P(
         200, "text/html; charset=utf-8", SHOWCASE_HTML_GZ, SHOWCASE_HTML_GZ_LEN);
+    res->addHeader("Content-Encoding", "gzip");
+    req->send(res);
+  };
+  server.on("/", HTTP_GET | HTTP_HEAD, sendShowcase);
+  server.on("/showcase", HTTP_GET | HTTP_HEAD, sendShowcase);   // alias
+
+  // Engineering dashboard — full manual control + debug, moved off the root.
+  server.on("/engineering", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
+    AsyncWebServerResponse *res = req->beginResponse_P(
+        200, "text/html; charset=utf-8", DASHBOARD_HTML_GZ, DASHBOARD_HTML_GZ_LEN);
     res->addHeader("Content-Encoding", "gzip");
     req->send(res);
   });
@@ -148,7 +151,9 @@ void setup() {
   });
 
   server.begin();
-  Serial.printf("[http] dashboard live at http://%s/\n",
+  Serial.printf("[http] showcase (client view) live at http://%s/\n",
+                WiFi.localIP().toString().c_str());
+  Serial.printf("[http] engineering dashboard at http://%s/engineering\n",
                 WiFi.localIP().toString().c_str());
 }
 

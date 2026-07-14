@@ -1,141 +1,159 @@
 <meta charset="utf-8">
-<title>Solar-Powered Farm Harvester · Live</title>
+<title>HarvestOps · Solar Harvester Fleet</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
-    --sky-top: #7fc5f0; --sky-bot: #dff1fb;
-    --field: #6fae4a; --field-dk: #4f8a34;
-    --soil: #b07a45;
-    --ink: #17313a; --ink-dim: #4a6472;
-    --card: #ffffff; --edge: #cfe0ea;
-    --sun: #ffd24a; --sun-glow: #ffb02e;
-    --accent: #0a8ea0; --good: #2f9e44; --warn: #e0872a; --crit: #d23f4d;
+    --sky-top: #8fcdf2; --page: #eef3f7;
+    --card: #ffffff; --card-2: #f5f9fc; --edge: #d3e0ea; --edge-hi: #c0d1de;
+    --ink: #17313a; --ink-dim: #5a7280; --ink-faint: #8aa0ad;
+    --accent: #0a8ea0; --accent-deep: #063e46;
+    --good: #2f9e44; --warn: #e0872a; --crit: #d23f4d;
+    --palm: #e35d6a; --pine: #4d8fe1; --banana: #e6c34d;
     --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --r: 14px;
   }
-  /* Night palette when the harvester is asleep */
   body.night {
-    --sky-top: #14243a; --sky-bot: #2b3f5c;
-    --field: #2f5a2e; --field-dk: #234522; --soil: #6b4a2c;
-    --ink: #e6eef5; --ink-dim: #9fb4c6;
-    --card: #16233a; --edge: #2b3f5c;
+    --sky-top: #14243a; --page: #101a2b;
+    --card: #16233a; --card-2: #121d30; --edge: #2b3f5c; --edge-hi: #35507a;
+    --ink: #e6eef5; --ink-dim: #9fb4c6; --ink-faint: #6f8598;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
   body {
-    font-family: var(--sans); color: var(--ink);
-    background: linear-gradient(180deg, var(--sky-top), var(--sky-bot));
-    min-height: 100vh; transition: background .8s ease, color .5s ease;
-    -webkit-font-smoothing: antialiased;
+    font-family: var(--sans); color: var(--ink); background-color: var(--page);
+    min-height: 100vh; transition: background-color .8s ease, color .5s ease; -webkit-font-smoothing: antialiased;
   }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition-duration: .01s !important; } }
 
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 1.2rem 1.1rem 2.5rem; }
-
-  header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; margin-bottom: 1rem; }
-  .logo { font-size: 2rem; line-height: 1; }
-  .titles { margin-right: auto; }
-  .titles .grp { font-family: var(--mono); font-size: .68rem; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); }
-  .titles h1 { margin: .05rem 0 0; font-size: 1.5rem; letter-spacing: .2px; }
-  .conn { display: flex; align-items: center; gap: .5rem; font-family: var(--mono); font-size: .74rem; color: var(--ink-dim);
-    background: color-mix(in srgb, var(--card) 70%, transparent); padding: .4rem .7rem; border-radius: 999px; border: 1px solid var(--edge); }
-  .conn .dot { width: 9px; height: 9px; border-radius: 50%; background: #9aa; }
+  /* ── App bar ── */
+  .appbar {
+    position: sticky; top: 0; z-index: 40; display: flex; align-items: center; gap: .8rem;
+    padding: .6rem 1.1rem; background: linear-gradient(180deg, var(--sky-top), color-mix(in srgb, var(--sky-top) 55%, var(--card)));
+    border-bottom: 1px solid var(--edge); backdrop-filter: blur(6px);
+  }
+  body.night .appbar { background: linear-gradient(180deg, #1a2c46, #16233a); }
+  .brand { display: flex; align-items: center; gap: .55rem; margin-right: 1rem; }
+  .brand .mark { font-size: 1.5rem; }
+  .brand b { font-size: 1.02rem; letter-spacing: .2px; }
+  .brand span { font-family: var(--mono); font-size: .58rem; letter-spacing: .14em; text-transform: uppercase; color: var(--accent-deep); display: block; }
+  body.night .brand span { color: #7fd6e2; }
+  .tabs { display: flex; gap: .2rem; margin-right: auto; flex-wrap: wrap; }
+  .tab {
+    font-family: var(--sans); font-size: .82rem; font-weight: 600; color: var(--ink-dim);
+    background: transparent; border: 0; border-radius: 9px; padding: .5rem .8rem; cursor: pointer; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: .4rem; transition: background .15s, color .15s;
+  }
+  .tab:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--ink); }
+  .tab.active { background: var(--card); color: var(--accent); box-shadow: 0 2px 8px -4px rgba(0,0,0,.3); }
+  .tab .demo-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+  .conn { display: flex; align-items: center; gap: .5rem; font-family: var(--mono); font-size: .72rem; color: var(--ink-dim);
+    background: var(--card); padding: .4rem .7rem; border-radius: 999px; border: 1px solid var(--edge); }
+  .conn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-faint); }
   .conn .dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 30%, transparent); animation: pulse 2s infinite; }
   .conn .dot.err { background: var(--crit); }
   @keyframes pulse { 50% { opacity: .4; } }
+  .avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 700; font-size: .8rem; }
 
-  /* ── The scene ── */
-  .scene {
-    position: relative; height: 340px; border-radius: 20px; overflow: hidden;
-    border: 1px solid var(--edge);
-    background: linear-gradient(180deg, transparent 0%, transparent 58%, var(--field) 58%, var(--field-dk) 100%);
-    box-shadow: 0 12px 40px -18px rgba(0,0,0,.4);
-  }
-  .sky-body { position: absolute; inset: 0; }
-  /* Sun / moon */
-  .sun {
-    position: absolute; top: 34px; right: 60px; width: 74px; height: 74px; border-radius: 50%;
-    background: radial-gradient(circle at 40% 38%, #fff2b8, var(--sun) 60%, var(--sun-glow));
-    box-shadow: 0 0 50px 12px color-mix(in srgb, var(--sun) 55%, transparent);
-    transition: opacity .8s ease, transform .8s ease, box-shadow .8s ease; font-size: 0;
-  }
-  body.night .sun { background: radial-gradient(circle at 38% 38%, #f2f4ff, #cfd6ef 62%, #aab3d6); box-shadow: 0 0 26px 6px rgba(180,190,230,.4); }
-  body.eco .sun { opacity: .35; }
-  /* Cloud (eco / cloudy) */
-  .cloud {
-    position: absolute; top: 40px; right: 40px; font-size: 4.6rem; line-height: 1;
-    opacity: 0; transform: translateX(30px); transition: opacity .6s ease, transform .6s ease;
-    filter: drop-shadow(0 6px 10px rgba(0,0,0,.15)); pointer-events: none;
-  }
-  body.eco .cloud { opacity: 1; transform: translateX(0); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 1.1rem 1.1rem 2.5rem; }
+  .panel { display: none; }
+  .panel.active { display: block; animation: fade .25s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); } }
 
-  /* Ground props */
-  .field-lbl, .barn-lbl {
-    position: absolute; bottom: 8px; font-family: var(--mono); font-size: .62rem; letter-spacing: .14em;
-    text-transform: uppercase; color: rgba(255,255,255,.85); font-weight: 700;
+  .demo-ribbon {
+    display: inline-flex; align-items: center; gap: .4rem; font-family: var(--mono); font-size: .62rem; font-weight: 700;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, var(--card)); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--edge));
+    padding: .3rem .6rem; border-radius: 999px; margin-bottom: 1rem;
   }
-  .field-lbl { left: 16px; } .barn-lbl { right: 16px; }
-  .crops { position: absolute; bottom: 40px; left: 10px; font-size: 2.1rem; letter-spacing: -6px; user-select: none; }
-  .barn { position: absolute; bottom: 44px; right: 26px; font-size: 3.4rem; line-height: 1; user-select: none; }
-  .arm {
-    position: absolute; bottom: 96px; right: 44px; font-size: 2.2rem; opacity: 0;
-    transform: translateY(-8px) rotate(0deg); transition: opacity .4s ease; transform-origin: top center;
-  }
-  body.extract .arm { opacity: 1; animation: lift 1.6s ease-in-out infinite; }
-  @keyframes lift { 0%,100% { transform: translateY(-8px) rotate(-6deg); } 50% { transform: translateY(4px) rotate(6deg); } }
 
-  /* The harvester */
-  .robot {
-    position: absolute; bottom: 46px; left: 82%; font-size: 3rem; line-height: 1;
-    transform: translateX(-50%) scaleX(-1); user-select: none;
-    transition: left 3.5s cubic-bezier(.45,.05,.35,1);
-    filter: drop-shadow(0 6px 8px rgba(0,0,0,.28));
-  }
-  body.fast .robot { transition-duration: 3.5s; }
-  body.slow .robot { transition-duration: 7s; }       /* eco: visibly slower */
-  .robot .zzz { position: absolute; top: -18px; right: -6px; font-size: 1rem; opacity: 0; transition: opacity .5s; }
-  body.night .robot .zzz { opacity: 1; }
-  .robot .puff { position: absolute; top: -10px; left: -14px; font-size: 1rem; opacity: 0; }
-  body.moving .robot .puff { opacity: .8; animation: puff 1.1s ease-out infinite; }
-  @keyframes puff { 0% { opacity: .7; transform: translate(0,0) scale(.8);} 100% { opacity: 0; transform: translate(-14px,-10px) scale(1.3);} }
+  .card { background: var(--card); border: 1px solid var(--edge); border-radius: var(--r); box-shadow: 0 10px 30px -22px rgba(0,0,0,.5); }
+  .card h3 { margin: 0; font-family: var(--mono); font-size: .64rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint); display: flex; align-items: center; gap: .5rem; }
+  .card h3 .live-mini { margin-left: auto; font-family: var(--mono); font-size: .58rem; letter-spacing: .1em; color: var(--good); display: none; }
+  .card h3 .live-mini.on { display: inline; }
+  h2.sec { margin: 0 0 .8rem; font-size: 1.15rem; }
 
-  /* ── FSM ribbon ── */
-  .fsm { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1.1rem 0 0; }
-  .fsm .st {
-    flex: 1; min-width: 130px; display: flex; align-items: center; gap: .5rem;
-    padding: .6rem .7rem; border-radius: 12px; background: var(--card); border: 1px solid var(--edge);
-    color: var(--ink-dim); font-weight: 600; font-size: .82rem; transition: all .3s ease;
-  }
-  .fsm .st .ico { font-size: 1.1rem; filter: grayscale(.6); opacity: .7; transition: all .3s; }
-  .fsm .st.active {
-    color: var(--ink); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--card));
-    box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--accent) 70%, transparent); transform: translateY(-2px);
-  }
-  .fsm .st.active .ico { filter: none; opacity: 1; transform: scale(1.15); }
-  .fsm .st.eco.active { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--card)); box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--warn) 70%, transparent); }
+  /* ── GPS hero ── */
+  .gps { display: grid; grid-template-columns: 1.55fr 1fr; gap: .9rem; align-items: stretch; }
+  @media (max-width: 820px) { .gps { grid-template-columns: 1fr; } }
+  .map-card { padding: 1rem 1.1rem 1.1rem; display: flex; flex-direction: column; gap: .7rem; }
+  .map-wrap { flex: 1; display: flex; justify-content: center; align-items: center; }
+  #mapSvg { width: 100%; max-width: 460px; height: auto; }
+  #mapSvg .gridline { stroke: var(--edge-hi); stroke-width: 2; }
+  #mapSvg .node { fill: var(--ink-faint); opacity: .55; }
+  #mapSvg .startzone { fill: color-mix(in srgb, var(--accent) 10%, transparent); }
+  #mapSvg .nogo { fill: color-mix(in srgb, var(--crit) 18%, transparent); }
+  #mapSvg .lbl { font-family: var(--mono); font-size: 9px; fill: var(--ink-dim); letter-spacing: .08em; }
+  #mapSvg .lbl.area { font-size: 8px; fill: var(--ink-dim); letter-spacing: .1em; }
+  #mapSvg .axlbl { font-family: var(--mono); font-size: 7px; fill: var(--ink-faint); }
+  #mapSvg .axcap { font-family: var(--mono); font-size: 7px; fill: var(--accent); font-weight: 700; }
+  #mapSvg .home { fill: none; stroke: var(--accent); stroke-width: 2; }
+  #mapSvg .dropzone { fill: none; stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  #mapSvg .blockm { stroke-width: 1.5; }
+  #mapSvg .blockm.unknown { fill: color-mix(in srgb, var(--ink-faint) 14%, transparent); stroke: var(--ink-faint); stroke-dasharray: 3 2; }
+  #mapSvg .blockm.target { stroke-width: 2.5; animation: blip 1.1s ease-in-out infinite; }
+  @keyframes blip { 50% { opacity: .3; } }
+  #mapSvg .fruit-ico { font-size: 15px; }
+  #mapSvg .fruit-ico.unknown { font-size: 12px; fill: var(--ink-faint); font-family: var(--mono); font-weight: 700; }
+  #mapSvg .fruit-lbl { font-family: var(--mono); font-size: 7px; font-weight: 700; fill: var(--ink-dim); letter-spacing: .02em; }
+  #mapSvg #trailLine { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .5; }
+  #mapSvg #robotG { transition: transform .6s ease; }
+  #mapSvg .robot-body { fill: color-mix(in srgb, var(--accent) 32%, var(--card)); stroke: var(--accent); stroke-width: 2; }
+  #mapSvg .robot-nose { fill: var(--accent); }
+  #mapSvg .robot-load { font-size: 12px; }
+  .map-legend { display: flex; gap: .9rem; flex-wrap: wrap; justify-content: center; font-family: var(--mono); font-size: .64rem; color: var(--ink-dim); }
+  .map-legend span { display: inline-flex; align-items: center; gap: .3rem; }
+  .map-legend i { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
 
-  /* ── Now-playing narration ── */
-  .now {
-    margin-top: 1.1rem; padding: 1.1rem 1.3rem; border-radius: 16px; background: var(--card); border: 1px solid var(--edge);
-    display: flex; align-items: center; gap: 1rem;
-  }
-  .now .big { font-size: 1.9rem; }
-  .now .txt h2 { margin: 0; font-size: 1.15rem; }
-  .now .txt p { margin: .25rem 0 0; color: var(--ink-dim); font-size: .92rem; line-height: 1.4; }
-  .now .badge {
-    margin-left: auto; align-self: flex-start; font-family: var(--mono); font-size: .64rem; font-weight: 700;
-    letter-spacing: .1em; text-transform: uppercase; padding: .3rem .6rem; border-radius: 999px;
-    color: #fff; background: var(--accent); white-space: nowrap;
-  }
-  .now .badge.eco { background: var(--warn); }
-  .now .badge.sleep { background: #64748b; }
+  .status { display: flex; flex-direction: column; gap: .9rem; }
+  .robot-id { padding: .9rem 1rem; display: flex; align-items: center; gap: .7rem; }
+  .robot-id .rico { font-size: 1.9rem; line-height: 1; }
+  .robot-id b { font-size: 1.05rem; display: block; }
+  .robot-id small { font-family: var(--mono); font-size: .62rem; color: var(--ink-faint); letter-spacing: .04em; }
+  .robot-id .badge { margin-left: auto; font-family: var(--mono); font-size: .6rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    padding: .28rem .55rem; border-radius: 999px; color: #fff; background: var(--accent); white-space: nowrap; }
+  .badge.sleep { background: #64748b; } .badge.eco { background: var(--warn); } .badge.wait { background: var(--good); }
+  .rows { padding: .3rem; display: flex; flex-direction: column; }
+  .row { display: flex; align-items: center; gap: .7rem; padding: .62rem .75rem; }
+  .row + .row { border-top: 1px solid var(--edge); }
+  .row .ic { font-size: 1.15rem; width: 1.5rem; text-align: center; }
+  .row .lab { font-family: var(--mono); font-size: .62rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+  .row .val { margin-left: auto; text-align: right; font-weight: 700; font-size: .95rem; }
+  .val.load.empty { color: var(--ink-faint); font-weight: 600; }
+  .solar { padding: .8rem 1rem 1rem; }
+  .solar .top { display: flex; align-items: baseline; gap: .5rem; }
+  .solar .top b { font-size: .95rem; } .solar .top .pct { margin-left: auto; font-family: var(--mono); font-weight: 700; }
+  .solar .bar { margin-top: .5rem; height: 9px; border-radius: 6px; background: var(--card-2); border: 1px solid var(--edge); overflow: hidden; }
+  .solar .bar > i { display: block; height: 100%; width: 100%; background: linear-gradient(90deg, var(--warn), var(--banana)); transition: width .8s ease, background .8s; }
+  body.eco .solar .bar > i { width: 34%; background: linear-gradient(90deg, var(--crit), var(--warn)); }
+  body.night .solar .bar > i { width: 8%; background: #48607e; }
 
-  /* ── Demo controls ── */
-  .controls { margin-top: 1.1rem; display: flex; gap: .6rem; flex-wrap: wrap; }
-  .controls button {
-    font-family: var(--sans); font-size: .92rem; font-weight: 700; color: var(--ink);
-    background: var(--card); border: 1px solid var(--edge); border-radius: 12px;
-    padding: .7rem 1.1rem; cursor: pointer; transition: transform .05s, border-color .15s, background .15s; flex: 1; min-width: 140px;
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: .7rem; margin-top: .9rem; }
+  @media (max-width: 640px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+  .tile { padding: .8rem .9rem; display: flex; flex-direction: column; gap: .35rem; }
+  .tile .lab { font-family: var(--mono); font-size: .58rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+  .tile .num { font-family: var(--mono); font-size: 1.6rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .tile .num small { font-size: .8rem; color: var(--ink-dim); font-weight: 400; }
+  .tile.fresh { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+
+  .stages { margin-top: .9rem; padding: 1rem 1.1rem; }
+  .stages .flow { margin-top: .7rem; display: flex; gap: .4rem; flex-wrap: wrap; }
+  .stages .st { flex: 1; min-width: 120px; display: flex; align-items: center; gap: .45rem; padding: .55rem .6rem; border-radius: 10px;
+    background: var(--card-2); border: 1px solid var(--edge); color: var(--ink-dim); font-weight: 600; font-size: .78rem; transition: all .3s ease; }
+  .stages .st .ico { font-size: 1rem; filter: grayscale(.6); opacity: .7; transition: all .3s; }
+  .stages .st.active { color: var(--ink); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--card)); box-shadow: 0 6px 16px -9px color-mix(in srgb, var(--accent) 70%, transparent); transform: translateY(-2px); }
+  .stages .st.active .ico { filter: none; opacity: 1; transform: scale(1.15); }
+  .stages .st.eco.active { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--card)); }
+  .now { margin-top: .8rem; display: flex; align-items: center; gap: .8rem; padding-top: .8rem; border-top: 1px solid var(--edge); }
+  .now .big { font-size: 1.7rem; }
+  .now h2 { margin: 0; font-size: 1.05rem; }
+  .now p { margin: .2rem 0 0; color: var(--ink-dim); font-size: .88rem; line-height: 1.4; }
+
+  .controls { margin-top: .9rem; display: flex; gap: .6rem; flex-wrap: wrap; }
+  .controls button, .controls select {
+    font-family: var(--sans); font-size: .9rem; font-weight: 700; color: var(--ink);
+    background: var(--card); border: 1px solid var(--edge); border-radius: 12px; padding: .7rem 1rem; cursor: pointer;
+    transition: transform .05s, border-color .15s, background .15s; flex: 1; min-width: 130px;
   }
   .controls button:hover:not(:disabled) { border-color: var(--accent); }
   .controls button:active:not(:disabled) { transform: translateY(1px); }
@@ -143,62 +161,225 @@
   .controls button.go { background: var(--good); color: #fff; border-color: var(--good); }
   .controls button.cloud.on { background: var(--warn); color: #fff; border-color: var(--warn); }
   .controls button.stop { background: var(--crit); color: #fff; border-color: var(--crit); }
-
   .ticker { margin-top: .8rem; font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); min-height: 1.1em; text-align: center; }
-  .foot { margin-top: 1.2rem; text-align: center; font-family: var(--mono); font-size: .66rem; color: var(--ink-dim); }
+
+  /* ── Dummy tabs ── */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem; margin-bottom: 1rem; }
+  @media (max-width: 720px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+  .kpi { padding: 1rem; }
+  .kpi .lab { font-family: var(--mono); font-size: .6rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+  .kpi .big { font-size: 1.9rem; font-weight: 800; margin-top: .3rem; font-variant-numeric: tabular-nums; }
+  .kpi .delta { font-family: var(--mono); font-size: .68rem; margin-top: .2rem; }
+  .kpi .delta.up { color: var(--good); } .kpi .delta.down { color: var(--crit); }
+  .chart { padding: 1.1rem; margin-bottom: 1rem; }
+  .bars { display: flex; align-items: flex-end; gap: .6rem; height: 150px; margin-top: 1rem; }
+  .bars .b { flex: 1; background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--card))); border-radius: 6px 6px 0 0; position: relative; }
+  .bars .b span { position: absolute; bottom: -1.3rem; left: 0; right: 0; text-align: center; font-family: var(--mono); font-size: .58rem; color: var(--ink-faint); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: .9rem; }
+  @media (max-width: 720px) { .split { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+  th, td { text-align: left; padding: .6rem .7rem; border-bottom: 1px solid var(--edge); }
+  th { font-family: var(--mono); font-size: .58rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+  .st-pill { font-family: var(--mono); font-size: .62rem; font-weight: 700; padding: .18rem .5rem; border-radius: 999px; }
+  .st-pill.online { color: var(--good); background: color-mix(in srgb, var(--good) 16%, transparent); }
+  .st-pill.charging { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+  .st-pill.offline { color: var(--ink-faint); background: color-mix(in srgb, var(--ink-faint) 16%, transparent); }
+  .alert { display: flex; align-items: center; gap: .8rem; padding: .8rem 1rem; border-bottom: 1px solid var(--edge); }
+  .alert .sev { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .alert .sev.hi { background: var(--crit); } .alert .sev.med { background: var(--warn); } .alert .sev.lo { background: var(--good); }
+  .alert .msg { font-size: .88rem; } .alert .msg small { display: block; color: var(--ink-faint); font-family: var(--mono); font-size: .62rem; margin-top: .1rem; }
+  .alert .when { margin-left: auto; font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); }
+  .setrow { display: flex; align-items: center; gap: .8rem; padding: .85rem 1rem; border-bottom: 1px solid var(--edge); }
+  .setrow .lab b { font-size: .9rem; } .setrow .lab small { display: block; color: var(--ink-dim); font-size: .74rem; }
+  .setrow .ctl { margin-left: auto; }
+  .switch { width: 42px; height: 24px; border-radius: 999px; background: var(--accent); position: relative; opacity: .55; }
+  .switch.off { background: var(--edge-hi); }
+  .switch::after { content: ""; position: absolute; top: 3px; right: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; }
+  .switch.off::after { right: auto; left: 3px; }
+
+  .foot { margin-top: 1.1rem; text-align: center; font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); }
   .foot a { color: var(--accent); }
 </style>
 
+<div class="appbar">
+  <div class="brand">
+    <span class="mark">🌱</span>
+    <div><b>HarvestOps</b><span>Solar Fleet Ops</span></div>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="tracker">🛰️ Live Tracker</button>
+    <button class="tab" data-tab="fleet">🚜 Fleet <span class="demo-dot" title="demo data"></span></button>
+    <button class="tab" data-tab="analytics">📊 Analytics <span class="demo-dot"></span></button>
+    <button class="tab" data-tab="alerts">🔔 Alerts <span class="demo-dot"></span></button>
+    <button class="tab" data-tab="settings">⚙️ Settings <span class="demo-dot"></span></button>
+  </nav>
+  <div class="conn"><span class="dot" id="dot"></span><span id="connLabel">connecting…</span></div>
+  <div class="avatar" title="Farm operator">FO</div>
+</div>
+
 <div class="wrap">
-  <header>
-    <div class="logo">🌱</div>
-    <div class="titles">
-      <div class="grp">Group 8 · live prototype</div>
-      <h1>The Solar-Powered Farm Harvester</h1>
+  <!-- ══ LIVE TRACKER (real) ══ -->
+  <section class="panel active" id="panel-tracker">
+    <div class="gps">
+      <section class="card map-card">
+        <h3>📡 GPS · live position <span class="live-mini" id="liveMini">● tracking</span></h3>
+        <div class="map-wrap">
+          <svg id="mapSvg" viewBox="0 0 326 202" role="img" aria-label="live field map with harvester GPS position"></svg>
+        </div>
+        <div class="map-legend">
+          <span><i style="background:var(--palm)"></i>🌴 Palm oil</span>
+          <span><i style="background:var(--pine)"></i>🍍 Pineapple</span>
+          <span><i style="background:var(--banana)"></i>🍌 Banana</span>
+          <span><i style="background:var(--ink-faint)"></i>❔ Unscanned</span>
+        </div>
+      </section>
+
+      <aside class="status">
+        <section class="card robot-id">
+          <span class="rico">🚜</span>
+          <div><b>Harvester-01</b><small id="poseVal">7, 3 · WEST</small></div>
+          <span class="badge sleep" id="badge">standby</span>
+        </section>
+        <section class="card rows">
+          <div class="row"><span class="ic">🛰️</span><span class="lab">Status</span><span class="val" id="stStatus">Sleep Mode</span></div>
+          <div class="row"><span class="ic">📍</span><span class="lab">Location</span><span class="val" id="stLoc">Barn · docked</span></div>
+          <div class="row"><span class="ic">🧺</span><span class="lab">Carrying</span><span class="val load empty" id="stLoad">Empty</span></div>
+          <div class="row"><span class="ic">🎯</span><span class="lab">Target</span><span class="val" id="stTarget">—</span></div>
+        </section>
+        <section class="card solar">
+          <div class="top"><span>☀️</span><b>Solar input</b><span class="pct" id="solarPct">100%</span></div>
+          <div class="bar"><i></i></div>
+          <div class="row" style="padding:.55rem .1rem 0"><span class="lab">Power mode</span><span class="val" id="stMode" style="font-size:.85rem">Normal</span></div>
+        </section>
+      </aside>
     </div>
-    <div class="conn"><span class="dot" id="dot"></span><span id="connLabel">connecting…</span></div>
-  </header>
 
-  <div class="scene" id="scene">
-    <div class="sky-body">
-      <div class="sun"></div>
-      <div class="cloud">☁️</div>
+    <div class="tiles">
+      <div class="card tile" id="tileDist"><span class="lab">Ultrasonic</span><span class="num"><span id="distVal">--</span><small> cm</small></span></div>
+      <div class="card tile" id="tileColor"><span class="lab">Colour seen</span><span class="num" id="colorVal" style="font-size:1rem">—</span></div>
+      <div class="card tile"><span class="lab">Deliveries</span><span class="num" id="deliveries">0</span></div>
+      <div class="card tile"><span class="lab">Online</span><span class="num" id="upTime" style="font-size:1.2rem">00:00</span></div>
     </div>
-    <span class="crops">🌾🌾🌾</span>
-    <span class="field-lbl">Field</span>
-    <span class="barn">🛖</span>
-    <span class="arm">🦾</span>
-    <span class="barn-lbl">Barn</span>
-    <div class="robot" id="robot">🚜<span class="zzz">💤</span><span class="puff">💨</span></div>
-  </div>
 
-  <div class="fsm" id="fsm">
-    <div class="st" data-fsm="sleep"><span class="ico">🌙</span>Sleep Mode</div>
-    <div class="st" data-fsm="field"><span class="ico">🌅</span>Moving to Field</div>
-    <div class="st" data-fsm="load"><span class="ico">📦</span>Loading</div>
-    <div class="st" data-fsm="barn"><span class="ico">🚚</span>Moving to Barn</div>
-    <div class="st eco" data-fsm="eco"><span class="ico">☁️</span>Eco-Mode</div>
-    <div class="st" data-fsm="wait"><span class="ico">🦾</span>Waiting for Extraction</div>
-  </div>
+    <section class="card stages">
+      <h3>🚜 Mission stage</h3>
+      <div class="flow" id="fsm">
+        <div class="st" data-fsm="sleep"><span class="ico">🌙</span>Sleep</div>
+        <div class="st" data-fsm="field"><span class="ico">🌅</span>To Field</div>
+        <div class="st" data-fsm="load"><span class="ico">📦</span>Loading</div>
+        <div class="st" data-fsm="barn"><span class="ico">🚚</span>To Barn</div>
+        <div class="st eco" data-fsm="eco"><span class="ico">☁️</span>Eco-Mode</div>
+        <div class="st" data-fsm="wait"><span class="ico">🦾</span>Extraction</div>
+      </div>
+      <div class="now">
+        <span class="big" id="nowIco">🌙</span>
+        <div><h2 id="nowTitle">Sleep Mode</h2><p id="nowDesc">Conserving battery. Waiting for the light sensor to detect sunrise.</p></div>
+      </div>
+    </section>
 
-  <div class="now">
-    <span class="big" id="nowIco">🌙</span>
-    <div class="txt">
-      <h2 id="nowTitle">Sleep Mode</h2>
-      <p id="nowDesc">Conserving battery. Waiting for the light sensor to detect sunrise.</p>
+    <div class="controls">
+      <select id="fruitSel" title="Which fruit to harvest">
+        <option value="0">🌴 Find palm oil</option>
+        <option value="1">🍍 Find pineapple</option>
+        <option value="2">🍌 Find banana</option>
+      </select>
+      <select id="rowSel" title="Where to look first — the robot scans onward until it finds the fruit">
+        <option value="1">Check row 1 first</option>
+        <option value="3">Check row 3 first</option>
+        <option value="5">Check row 5 first</option>
+      </select>
+      <button class="go"    id="btnStart" disabled>▶ Dispatch harvest</button>
+      <button class="cloud" id="btnCloud" disabled>☁ Cloud (Eco-Mode)</button>
+      <button class="stop"  id="btnStop"  disabled>■ Stop</button>
+      <button            id="btnReset" disabled>⌂ Reset</button>
     </div>
-    <span class="badge sleep" id="nowBadge">standby</span>
-  </div>
+    <div class="ticker" id="ticker">Waiting for the harvester…</div>
+  </section>
 
-  <div class="controls">
-    <button class="go"    id="btnStart" disabled>▶ Start harvest</button>
-    <button class="cloud" id="btnCloud" disabled>☁ Cloud passes (Eco-Mode)</button>
-    <button class="stop"  id="btnStop"  disabled>■ Stop</button>
-    <button            id="btnReset" disabled>⌂ Reset</button>
-  </div>
+  <!-- ══ FLEET (dummy) ══ -->
+  <section class="panel" id="panel-fleet">
+    <span class="demo-ribbon">◆ Demo data · single live unit</span>
+    <h2 class="sec">Fleet overview</h2>
+    <section class="card" style="overflow:hidden">
+      <table>
+        <thead><tr><th>Unit</th><th>Status</th><th>Zone</th><th>Carrying</th><th>Battery</th><th>Today</th></tr></thead>
+        <tbody>
+          <tr><td><b>Harvester-01</b> <small style="color:var(--good)">● live</small></td><td><span class="st-pill online">online</span></td><td id="fleetZone">Barn</td><td id="fleetLoad">—</td><td>100%</td><td id="fleetDeliv">0</td></tr>
+          <tr><td><b>Harvester-02</b></td><td><span class="st-pill charging">charging</span></td><td>Solar dock</td><td>Empty</td><td>62%</td><td>34</td></tr>
+          <tr><td><b>Harvester-03</b></td><td><span class="st-pill online">online</span></td><td>Field · row 4</td><td>🍍 Pineapple</td><td>88%</td><td>41</td></tr>
+          <tr><td><b>Harvester-04</b></td><td><span class="st-pill offline">offline</span></td><td>Maintenance</td><td>Empty</td><td>—</td><td>0</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </section>
 
-  <div class="ticker" id="ticker">Waiting for the harvester…</div>
-  <p class="foot">Live over WiFi · driven by the same robot as the <a href="/">engineering dashboard</a>. This view narrates the finite-state machine for demo day.</p>
+  <!-- ══ ANALYTICS (dummy) ══ -->
+  <section class="panel" id="panel-analytics">
+    <span class="demo-ribbon">◆ Demo data</span>
+    <h2 class="sec">Harvest analytics</h2>
+    <div class="kpis">
+      <div class="card kpi"><div class="lab">Deliveries today</div><div class="big">128</div><div class="delta up">▲ 12% vs yfield avg</div></div>
+      <div class="card kpi"><div class="lab">Avg cycle time</div><div class="big">3:42</div><div class="delta up">▲ 8s faster</div></div>
+      <div class="card kpi"><div class="lab">Fleet uptime</div><div class="big">99.2%</div><div class="delta up">▲ 0.4%</div></div>
+      <div class="card kpi"><div class="lab">Eco-Mode time</div><div class="big">17%</div><div class="delta down">▼ cloud cover</div></div>
+    </div>
+    <section class="card chart">
+      <h3>📈 Deliveries · last 7 days</h3>
+      <div class="bars">
+        <div class="b" style="height:55%"><span>Mon</span></div>
+        <div class="b" style="height:72%"><span>Tue</span></div>
+        <div class="b" style="height:48%"><span>Wed</span></div>
+        <div class="b" style="height:85%"><span>Thu</span></div>
+        <div class="b" style="height:63%"><span>Fri</span></div>
+        <div class="b" style="height:92%"><span>Sat</span></div>
+        <div class="b" style="height:78%"><span>Sun</span></div>
+      </div>
+    </section>
+    <div class="split">
+      <section class="card kpi"><div class="lab">Harvest mix</div>
+        <div style="margin-top:.6rem; display:flex; flex-direction:column; gap:.5rem; font-size:.85rem">
+          <div>🌴 Palm oil <b style="float:right">46%</b></div>
+          <div>🍍 Pineapple <b style="float:right">31%</b></div>
+          <div>🍌 Banana <b style="float:right">23%</b></div>
+        </div>
+      </section>
+      <section class="card kpi"><div class="lab">Energy source</div>
+        <div style="margin-top:.6rem; display:flex; flex-direction:column; gap:.5rem; font-size:.85rem">
+          <div>☀️ Solar direct <b style="float:right">83%</b></div>
+          <div>🔋 Battery buffer <b style="float:right">15%</b></div>
+          <div>🔌 Grid backup <b style="float:right">2%</b></div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══ ALERTS (dummy) ══ -->
+  <section class="panel" id="panel-alerts">
+    <span class="demo-ribbon">◆ Demo data</span>
+    <h2 class="sec">Alerts &amp; events</h2>
+    <section class="card" style="overflow:hidden">
+      <div class="alert"><span class="sev med"></span><div class="msg">Cloud cover — Harvester-01 entered Eco-Mode<small>solar input dropped to 34%</small></div><span class="when">2m ago</span></div>
+      <div class="alert"><span class="sev lo"></span><div class="msg">Bin full — weight sensor tripped at Field row 3<small>Harvester-03</small></div><span class="when">14m ago</span></div>
+      <div class="alert"><span class="sev hi"></span><div class="msg">Harvester-04 offline — scheduled maintenance<small>gripper servo replacement</small></div><span class="when">1h ago</span></div>
+      <div class="alert"><span class="sev lo"></span><div class="msg">Extraction complete — gantry arm cleared bin<small>Harvester-01 · palm oil</small></div><span class="when">1h ago</span></div>
+      <div class="alert"><span class="sev med"></span><div class="msg">Battery buffer engaged — dusk approaching<small>Harvester-02 returning to dock</small></div><span class="when">2h ago</span></div>
+    </section>
+  </section>
+
+  <!-- ══ SETTINGS (dummy) ══ -->
+  <section class="panel" id="panel-settings">
+    <span class="demo-ribbon">◆ Demo data · read-only</span>
+    <h2 class="sec">Fleet settings</h2>
+    <section class="card" style="overflow:hidden">
+      <div class="setrow"><div class="lab"><b>Auto-dispatch at sunrise</b><small>Wake units when the light sensor crosses threshold</small></div><div class="ctl"><div class="switch"></div></div></div>
+      <div class="setrow"><div class="lab"><b>Eco-Mode on low solar</b><small>Slow down &amp; shed non-essential sensors under cloud cover</small></div><div class="ctl"><div class="switch"></div></div></div>
+      <div class="setrow"><div class="lab"><b>Return to dock at sunset</b><small>Park &amp; sleep once daylight ends</small></div><div class="ctl"><div class="switch"></div></div></div>
+      <div class="setrow"><div class="lab"><b>Gentle-grip mode</b><small>Reduce claw force to prevent bruising</small></div><div class="ctl"><div class="switch off"></div></div></div>
+      <div class="setrow"><div class="lab"><b>Solar-input threshold</b><small>Eco-Mode trigger level</small></div><div class="ctl" style="font-family:var(--mono); font-weight:700">40%</div></div>
+    </section>
+  </section>
+
+  <p class="foot">Live telemetry over WiFi · Group 8 Solar-Powered Farm Harvester. Operators: open the <a href="/engineering">engineering dashboard</a> for manual control &amp; diagnostics. Non-tracker tabs show representative demo data.</p>
 </div>
 
 <script>
@@ -207,49 +388,177 @@
   const $ = (id) => document.getElementById(id);
   const body = document.body;
 
-  // ── State descriptions (Group 8 FSM) ──
-  const STATES = {
-    sleep: { ico: "🌙", title: "Sleep Mode",             badge: "standby",  cls: "sleep",
-      desc: "Conserving battery. Waiting for the light sensor to detect sunrise." },
-    field: { ico: "🌅", title: "Moving to Field",        badge: "driving",  cls: "",
-      desc: "Sunrise detected — the harvester wakes and drives out to the field." },
-    load:  { ico: "📦", title: "Loading",                badge: "waiting",  cls: "",
-      desc: "At the field, waiting in the Loading state until the farmer fills its bin. When the weight sensor trips, it heads for the barn." },
-    barn:  { ico: "🚚", title: "Moving to Barn",         badge: "driving",  cls: "",
-      desc: "Bin full — carrying the freshly picked fruit back toward the barn." },
-    eco:   { ico: "☁️", title: "Eco-Mode",               badge: "eco",      cls: "eco",
-      desc: "A cloud dropped the solar input. Running in Eco-Mode: moving slower and turning off non-essential sensors to save power." },
-    wait:  { ico: "🦾", title: "Waiting for Extraction", badge: "at barn",  cls: "",
-      desc: "At the barn. Signaling the heavy-duty gantry arm to lift the fruit out of the bin without bruising it." },
+  // ── Tabs ──
+  document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach((x) => x.classList.remove("active"));
+    t.classList.add("active");
+    $("panel-" + t.dataset.tab).classList.add("active");
+  }));
+
+  // ── Fruit identities. Positions are UNKNOWN/random — a slot's fruit is only
+  // known once the robot drives there and its colour sensor scans it. ──
+  const FRUITS = {
+    RED:    { name: "Palm oil",  emoji: "🌴", css: "var(--palm)" },
+    BLUE:   { name: "Pineapple", emoji: "🍍", css: "var(--pine)" },
+    YELLOW: { name: "Banana",    emoji: "🍌", css: "var(--banana)" },
   };
-  // Where the harvester sits in the scene for each state (% from left).
-  const POS = { sleep: 82, field: 8, load: 8, barn: 82, eco: 48, wait: 82 };
+  const COLOR_BY_IDX = ["RED", "BLUE", "YELLOW"];   // fruit selector index → sensor colour
+  const SLOT_ROWS = [1, 3, 5];                       // physical block positions (X=1)
+  const STATES = {
+    sleep: { ico: "🌙", title: "Sleep Mode",             badge: "standby", bcls: "sleep", loc: "Barn · docked",
+      desc: "Conserving battery. Waiting for the light sensor to detect sunrise." },
+    field: { ico: "🌅", title: "Moving to Field",        badge: "driving", bcls: "",      loc: "En route → field",
+      desc: "Sunrise detected — the harvester wakes and drives out to the field." },
+    load:  { ico: "📦", title: "Loading",                badge: "loading", bcls: "",      loc: "Field · loading bay",
+      desc: "Waiting in the Loading state until the bin is filled. When the weight sensor trips, it heads for the barn." },
+    barn:  { ico: "🚚", title: "Moving to Barn",         badge: "hauling", bcls: "",      loc: "En route → barn",
+      desc: "Bin full — carrying the freshly picked fruit back toward the barn." },
+    eco:   { ico: "☁️", title: "Eco-Mode",               badge: "eco",     bcls: "eco",   loc: "In transit (Eco)",
+      desc: "A cloud dropped the solar input. Running in Eco-Mode: moving slower, non-essential sensors off." },
+    wait:  { ico: "🦾", title: "Waiting for Extraction", badge: "at barn", bcls: "wait",  loc: "Barn · unloading",
+      desc: "At the barn. Signalling the heavy-duty gantry arm to lift the fruit out of the bin without bruising it." },
+  };
 
   let fsmState = null;
   function apply(key) {
     if (!key || key === fsmState) return;
-    const prev = fsmState; fsmState = key;
-    const s = STATES[key];
-
-    document.querySelectorAll(".fsm .st").forEach((el) => el.classList.toggle("active", el.dataset.fsm === key));
-    $("nowIco").textContent = s.ico;
-    $("nowTitle").textContent = s.title;
-    $("nowDesc").textContent = s.desc;
-    $("nowBadge").textContent = s.badge;
-    $("nowBadge").className = "badge " + s.cls;
-
-    // Scene reactions
-    $("robot").style.left = POS[key] + "%";
+    fsmState = key; const s = STATES[key];
+    document.querySelectorAll("#fsm .st").forEach((el) => el.classList.toggle("active", el.dataset.fsm === key));
+    $("nowIco").textContent = s.ico; $("nowTitle").textContent = s.title; $("nowDesc").textContent = s.desc;
+    $("stStatus").textContent = s.title; $("stLoc").textContent = s.loc;
+    $("badge").textContent = s.badge; $("badge").className = "badge " + s.bcls;
+    $("stMode").textContent = key === "eco" ? "Eco-Mode" : "Normal";
+    $("solarPct").textContent = key === "eco" ? "34%" : (key === "sleep" ? "0%" : "100%");
+    $("fleetZone").textContent = s.loc.replace(/ ·.*/, "").replace(/^En route.*/, "In transit");
     body.classList.toggle("night", key === "sleep");
     body.classList.toggle("eco", key === "eco");
-    body.classList.toggle("slow", key === "eco");
-    body.classList.toggle("extract", key === "wait");
-    const moving = key === "field" || key === "barn" || key === "eco";
-    body.classList.toggle("moving", moving);
   }
 
-  // ── FSM detection from firmware log lines (mirrors the engineering dashboard) ──
-  // "SOFTWARE DISABLED" is NOT an eco cue — it fires on every normal grab.
+  // ── Load / target / block reveal (slots keyed by ROW; fruit unknown until scanned) ──
+  let carrying = null, lastDetected = null, deliveries = 0, lastPos = { x: 7, y: 3 };
+  function revealSlot(row, color) {
+    const f = FRUITS[color]; if (!f || !SLOT_ROWS.includes(row)) return;
+    const rect = document.querySelector('#mapSvg .blockm[data-slot="' + row + '"]');
+    if (rect) { rect.classList.remove("unknown"); rect.setAttribute("fill", "color-mix(in srgb, " + f.css + " 24%, transparent)"); rect.setAttribute("stroke", f.css); rect.dataset.fruit = color; }
+    const ico = document.querySelector('#mapSvg [data-ico="' + row + '"]'); if (ico) { ico.textContent = f.emoji; ico.classList.remove("unknown"); }
+    const lbl = document.querySelector('#mapSvg [data-lbl="' + row + '"]'); if (lbl) lbl.textContent = f.name;
+  }
+  function hideBlocks() {
+    SLOT_ROWS.forEach((row) => {
+      const rect = document.querySelector('#mapSvg .blockm[data-slot="' + row + '"]');
+      if (rect) { rect.classList.add("unknown"); rect.classList.remove("target"); rect.removeAttribute("fill"); rect.removeAttribute("stroke"); delete rect.dataset.fruit; }
+      const ico = document.querySelector('#mapSvg [data-ico="' + row + '"]'); if (ico) { ico.textContent = "?"; ico.classList.add("unknown"); }
+      const lbl = document.querySelector('#mapSvg [data-lbl="' + row + '"]'); if (lbl) lbl.textContent = "unscanned";
+    });
+  }
+  function setTarget(color) { const f = FRUITS[color]; $("stTarget").textContent = f ? (f.emoji + " " + f.name) : "—"; }
+  // Pulse the block the robot is currently checking (at column X≈1).
+  function setScanningRow(x, y) {
+    const atBlock = x <= 1 && SLOT_ROWS.includes(y);
+    document.querySelectorAll("#mapSvg .blockm").forEach((el) => el.classList.toggle("target", atBlock && +el.dataset.slot === y));
+  }
+  function setCarry(color) {
+    carrying = color; const f = color ? FRUITS[color] : null;
+    $("stLoad").textContent = f ? (f.emoji + " " + f.name) : "Empty";
+    $("stLoad").classList.toggle("empty", !f);
+    $("fleetLoad").textContent = f ? (f.emoji + " " + f.name) : "Empty";
+    const rl = $("robotLoad"); if (rl) rl.textContent = f ? f.emoji : "";
+  }
+  function parseLoad(text) {
+    let m = text.match(/target=(RED|BLUE|YELLOW)/i) || text.match(/\[ACK\]\s*(?:SEARCH|GRB target)\s+(RED|BLUE|YELLOW)/i);
+    if (m) setTarget(m[1].toUpperCase());
+    let d = text.match(/detected=(RED|BLUE|YELLOW)/i);   // robot scanned this block → reveal fruit at its current row
+    if (d) { lastDetected = d[1].toUpperCase(); revealSlot(lastPos.y, lastDetected); }
+    if (/SOFTWARE DISABLED/i.test(text) && lastDetected) setCarry(lastDetected);   // grip succeeded → now carrying
+    if (/releasing grip|Drop zone reached|Drop node .* reached|\[ACK\]\s*DRP|open claw/i.test(text)) {
+      if (carrying) { deliveries++; $("deliveries").textContent = deliveries; $("fleetDeliv").textContent = deliveries; }
+      setCarry(null);
+    }
+  }
+
+  // ── Telemetry tiles ──
+  const freshT = {};
+  function markFresh(id) { const el = $(id); el.classList.add("fresh"); clearTimeout(freshT[id]); freshT[id] = setTimeout(() => el.classList.remove("fresh"), 400); }
+  function parseTelemetry(text) {
+    const m = text.match(/distance:\s*(-{2,3}|\d+)\s*cm\s*\|\s*color:\s*([A-Za-z\/ ]+)/i);
+    if (!m) return;
+    $("distVal").textContent = /-/.test(m[1]) ? "--" : parseInt(m[1], 10); markFresh("tileDist");
+    const up = m[2].trim().toUpperCase();
+    const k = Object.keys(FRUITS).find((x) => up.startsWith(x));
+    $("colorVal").textContent = k ? (FRUITS[k].emoji + " " + FRUITS[k].name) : m[2].trim(); markFresh("tileColor");
+  }
+
+  // ── Live GPS map ──
+  const MAP = { CELL: 28, ML: 30, MT: 14 };
+  const COLL = { x0: 0, x1: 6, y0: 0, y1: 6 };
+  const START = { x0: 6, x1: 9, y0: 2, y1: 4 };
+  const DROP = { x0: 9, x1: 10, y0: 2, y1: 4 };
+  const HEADING_NAMES = ["NORTH", "EAST", "SOUTH", "WEST"];
+  const mapPx = (x) => MAP.ML + x * MAP.CELL;
+  const mapPy = (y) => MAP.MT + (COLL.y1 - y) * MAP.CELL;
+  let trailPts = [];
+  function svgEl(tag, attrs, text) { const el = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const k in attrs) el.setAttribute(k, attrs[k]); if (text != null) el.textContent = text; return el; }
+  const gline = (x1, y1, x2, y2) => svgEl("line", { class: "gridline", x1, y1, x2, y2 });
+  function buildMap() {
+    const svg = $("mapSvg");
+    svg.append(svgEl("rect", { class: "startzone", x: mapPx(START.x0), y: mapPy(START.y1), width: (START.x1 - START.x0) * MAP.CELL, height: (START.y1 - START.y0) * MAP.CELL }));
+    for (let x = COLL.x0; x <= COLL.x1; x++) svg.append(gline(mapPx(x), mapPy(COLL.y1), mapPx(x), mapPy(COLL.y0)));
+    for (let y = COLL.y0; y <= COLL.y1; y++) svg.append(gline(mapPx(COLL.x0), mapPy(y), mapPx(COLL.x1), mapPy(y)));
+    for (let x = START.x0 + 1; x <= START.x1; x++) svg.append(gline(mapPx(x), mapPy(START.y1), mapPx(x), mapPy(START.y0)));
+    for (let y = START.y0; y <= START.y1; y++) svg.append(gline(mapPx(START.x0), mapPy(y), mapPx(START.x1), mapPy(y)));
+    for (let x = COLL.x0; x <= COLL.x1; x++) for (let y = COLL.y0; y <= COLL.y1; y++) svg.append(svgEl("circle", { class: "node", cx: mapPx(x), cy: mapPy(y), r: 2.3 }));
+    for (let x = START.x0 + 1; x <= START.x1; x++) for (let y = START.y0; y <= START.y1; y++) svg.append(svgEl("circle", { class: "node", cx: mapPx(x), cy: mapPy(y), r: 2.3 }));
+    for (let x = COLL.x0; x <= DROP.x1; x++) svg.append(svgEl("text", { class: "axlbl", x: mapPx(x), y: mapPy(0) + 13, "text-anchor": "middle" }, x));
+    for (let y = COLL.y0; y <= COLL.y1; y++) svg.append(svgEl("text", { class: "axlbl", x: mapPx(0) - 13, y: mapPy(y) + 3, "text-anchor": "middle" }, y));
+    svg.append(svgEl("text", { class: "axcap", x: mapPx(DROP.x1) + 6, y: mapPy(0) + 13 }, "X→"));
+    svg.append(svgEl("text", { class: "axcap", x: mapPx(0) - 22, y: mapPy(6) - 5 }, "Y↑"));
+    const C = MAP.CELL;
+    const nogo = (x, y, w, h) => svg.append(svgEl("rect", { class: "nogo", x, y, width: w, height: h }));
+    nogo(mapPx(0), mapPy(6), C, 6 * C); nogo(mapPx(0), mapPy(6), 6 * C, C); nogo(mapPx(0), mapPy(1), 6 * C, C);
+    nogo(mapPx(5), mapPy(6), C, 2 * C); nogo(mapPx(5), mapPy(2), C, 2 * C);
+    svg.append(svgEl("text", { class: "lbl area", x: mapPx(0) + 4, y: mapPy(6) - 6 }, "FIELD"));
+    // Fruit slots at rows 1/3/5 — start UNKNOWN, revealed only when scanned
+    SLOT_ROWS.forEach((row) => {
+      svg.append(svgEl("rect", { class: "blockm unknown", "data-slot": row, x: mapPx(1) - 9, y: mapPy(row) - 9, width: 18, height: 18, rx: 4 }));
+      svg.append(svgEl("text", { class: "fruit-ico unknown", "data-ico": row, x: mapPx(1), y: mapPy(row) + 4, "text-anchor": "middle" }, "?"));
+      svg.append(svgEl("text", { class: "fruit-lbl", "data-lbl": row, x: mapPx(1), y: mapPy(row) + 20, "text-anchor": "middle" }, "unscanned"));
+    });
+    const sL = mapPx(START.x0), sR = mapPx(START.x1), sT = mapPy(START.y1), sB = mapPy(START.y0), BAND = 5;
+    svg.append(svgEl("rect", { class: "nogo", x: sL, y: sT, width: sR - sL, height: BAND }));
+    svg.append(svgEl("rect", { class: "nogo", x: sL, y: sB - BAND, width: sR - sL, height: BAND }));
+    const scx = (mapPx(START.x0) + mapPx(START.x1)) / 2;
+    svg.append(svgEl("text", { class: "lbl", x: scx, y: mapPy(START.y1) - 5, "text-anchor": "middle" }, "START"));
+    svg.append(svgEl("rect", { class: "home", x: mapPx(7) - 8, y: mapPy(3) - 8, width: 16, height: 16, rx: 4 }));
+    svg.append(svgEl("text", { class: "lbl", x: mapPx(7), y: mapPy(3) + 18, "text-anchor": "middle" }, "HOME"));
+    svg.append(svgEl("rect", { class: "dropzone", x: mapPx(DROP.x0) + 4, y: mapPy(DROP.y1), width: (DROP.x1 - DROP.x0) * MAP.CELL - 6, height: (DROP.y1 - DROP.y0) * MAP.CELL, rx: 8 }));
+    const dcx = mapPx(DROP.x0) + (DROP.x1 - DROP.x0) * MAP.CELL / 2;
+    svg.append(svgEl("text", { class: "lbl", x: dcx, y: mapPy(2.5) + 3, "text-anchor": "middle", transform: "rotate(90 " + dcx + " " + (mapPy(2.5) + 3) + ")" }, "BARN"));
+    svg.append(svgEl("polyline", { id: "trailLine", points: "" }));
+    const g = svgEl("g", { id: "robotG" });
+    g.append(svgEl("circle", { class: "robot-body", r: 10 }));
+    g.append(svgEl("path", { class: "robot-nose", d: "M 0 -13 L 5 -5 L -5 -5 Z" }));
+    g.append(svgEl("text", { id: "robotLoad", class: "robot-load", x: 0, y: 4, "text-anchor": "middle" }, ""));
+    svg.append(g);
+    updateMap(7, 3, 3, true);
+  }
+  function updateMap(x, y, h, skipTrail) {
+    const g = $("robotG");
+    g.style.transform = "translate(" + mapPx(x) + "px," + mapPy(y) + "px) rotate(" + h * 90 + "deg)";
+    const rl = $("robotLoad"); if (rl) rl.setAttribute("transform", "rotate(" + (-h * 90) + ")");
+    $("poseVal").textContent = x + ", " + y + " · " + HEADING_NAMES[h];
+    if (skipTrail) return;
+    const pt = mapPx(x) + "," + mapPy(y);
+    if (trailPts[trailPts.length - 1] !== pt) { trailPts.push(pt); if (trailPts.length > 80) trailPts.shift(); $("trailLine").setAttribute("points", trailPts.join(" ")); }
+  }
+  function resetTrail() { trailPts = []; $("trailLine").setAttribute("points", ""); }
+  function parseMap(text) {
+    const pm = text.match(/^\[POS\]\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*([0-3])/);
+    if (pm) { const x = +pm[1], y = +pm[2]; lastPos = { x, y }; updateMap(x, y, +pm[3]); setScanningRow(x, y); return; }
+    if (/Navigation Tracker Reset|Reset to Default Home/i.test(text)) { resetTrail(); setCarry(null); setTarget(null); hideBlocks(); }
+  }
+
+  // ── FSM detection ──
   const RULES = [
     [/Waiting for Extraction|Drop zone reached|Drop node .* reached|releasing grip/i, "wait"],
     [/Eco-?Mode ENGAGED|non-essential sensors off/i,                                  "eco"],
@@ -258,49 +567,44 @@
     [/Moving to Field|\[SEARCH\]|Target Node Reached|Aligning to WEST/i,              "field"],
     [/Sleep Mode|Robot Halted|EMERGENCY STOP|\[BOOT\]|^===/i,                         "sleep"],
   ];
-  function detect(text) {
-    for (const [re, key] of RULES) if (re.test(text)) { apply(key); return; }
-  }
+  function detect(text) { for (const [re, key] of RULES) if (re.test(text)) { apply(key); return; } }
+  function handleLine(l) { parseMap(l); parseLoad(l); parseTelemetry(l); detect(l); $("ticker").textContent = l; }
 
-  // ── WebSocket link (served by the ESP32; ?host= overrides for file:// preview) ──
-  let ws = null, manualClose = false, reconnectTimer = null, ecoOn = false;
+  // ── WebSocket ──
+  let ws = null, manualClose = false, reconnectTimer = null, ecoOn = false, startMs = null, upHandle = null;
   function wsUrl() {
     const q = new URLSearchParams(location.search).get("host");
     if (q) return "ws://" + q + "/ws";
     if (location.protocol === "file:") return "ws://mecanumcar.local/ws";
     return "ws://" + location.host + "/ws";
   }
-  function setConn(label, cls) { $("connLabel").textContent = label; $("dot").className = "dot" + (cls ? " " + cls : ""); }
+  function setConn(label, cls) { $("connLabel").textContent = label; $("dot").className = "dot" + (cls ? " " + cls : ""); $("liveMini").classList.toggle("on", cls === "on"); }
   function setControls(on) { ["btnStart","btnCloud","btnStop","btnReset"].forEach((id) => $(id).disabled = !on); }
-
+  function tickUp() { if (startMs == null) return; const s = Math.floor((performance.now() - startMs) / 1000); $("upTime").textContent = String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0"); }
   function connect() {
-    manualClose = false;
-    setConn("connecting…", "");
-    try { ws = new WebSocket(wsUrl()); }
-    catch (e) { setConn("error", "err"); scheduleReconnect(); return; }
-    ws.addEventListener("open", () => { setConn("live", "on"); setControls(true); });
-    ws.addEventListener("message", (ev) => {
-      String(ev.data).split(/\r?\n/).forEach((l) => { if (l.length) { detect(l); $("ticker").textContent = l; } });
-    });
-    ws.addEventListener("close", () => {
-      setConn("offline", ""); setControls(false); ws = null;
-      apply("sleep"); setCloud(false);
-      if (!manualClose) scheduleReconnect();
-    });
+    manualClose = false; setConn("connecting…", "");
+    try { ws = new WebSocket(wsUrl()); } catch (e) { setConn("error", "err"); scheduleReconnect(); return; }
+    ws.addEventListener("open", () => { startMs = performance.now(); setConn("live", "on"); setControls(true); clearInterval(upHandle); upHandle = setInterval(tickUp, 1000); });
+    ws.addEventListener("message", (ev) => { String(ev.data).split(/\r?\n/).forEach((l) => { if (l.length) handleLine(l); }); });
+    ws.addEventListener("close", () => { setConn("offline", ""); setControls(false); clearInterval(upHandle); ws = null; apply("sleep"); setCloud(false); if (!manualClose) scheduleReconnect(); });
     ws.addEventListener("error", () => setConn("error", "err"));
   }
   function scheduleReconnect() { clearTimeout(reconnectTimer); reconnectTimer = setTimeout(() => { if (!ws && !manualClose) connect(); }, 2000); }
   function send(cmd) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(cmd); }
-
-  function setCloud(on) { ecoOn = on; $("btnCloud").classList.toggle("on", on); $("btnCloud").textContent = on ? "☀ Clear the cloud" : "☁ Cloud passes (Eco-Mode)"; }
-
-  $("btnStart").addEventListener("click", () => send("SEARCH:1"));   // full harvest mission (RED, row 1)
+  function setCloud(on) { ecoOn = on; $("btnCloud").classList.toggle("on", on); $("btnCloud").textContent = on ? "☀ Clear cloud" : "☁ Cloud (Eco-Mode)"; }
+  $("btnStart").addEventListener("click", () => {
+    const c = parseInt($("fruitSel").value, 10);   // 0=palm/RED, 1=pineapple/BLUE, 2=banana/YELLOW
+    const r = parseInt($("rowSel").value, 10);       // 1/3/5 — which position to check first
+    setTarget(COLOR_BY_IDX[c]);                       // show the chosen fruit as the target
+    // Firmware searchGrabAndDrop(colour, startRow) scans from row r onward until
+    // the colour sensor finds the target fruit — arg = colour*10 + startRow.
+    send("SEARCH:" + (c * 10 + r));
+  });
   $("btnStop").addEventListener("click", () => send("STOP"));
   $("btnReset").addEventListener("click", () => send("RESET"));
   $("btnCloud").addEventListener("click", () => { const next = !ecoOn; send("ECO:" + (next ? 1 : 0)); setCloud(next); });
 
-  apply("sleep");
-  connect();
+  buildMap(); apply("sleep"); connect();
   window.addEventListener("beforeunload", () => { manualClose = true; if (ws) ws.close(); });
 })();
 </script>
