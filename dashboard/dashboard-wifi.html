@@ -257,6 +257,63 @@
 
   .foot { margin-top: 1.4rem; font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); text-align: center; }
 
+  /* Demo · mission brief + FSM */
+  .mission-head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .mission-head .grp {
+    font-family: var(--mono); font-size: .62rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    color: #04222a; background: var(--phos); padding: .2rem .5rem; border-radius: 6px;
+  }
+  .mission-head .ttl { font-size: 1.05rem; font-weight: 700; letter-spacing: .1px; }
+  .mission-brief { font-size: .84rem; color: var(--ink-dim); line-height: 1.5; margin: 0; }
+  .mission-brief b { color: var(--ink); }
+
+  /* FSM state flow */
+  .fsm-flow { display: flex; align-items: center; flex-wrap: wrap; gap: .35rem .1rem; }
+  .fsm-state {
+    display: inline-flex; align-items: center; gap: .4rem;
+    font-family: var(--mono); font-size: .72rem; font-weight: 600;
+    padding: .38rem .6rem; border-radius: 7px;
+    background: var(--panel-2); border: 1px solid var(--edge-hi); color: var(--ink-dim);
+    transition: border-color .2s, color .2s, box-shadow .2s, background .2s;
+  }
+  .fsm-state .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); flex: none; }
+  .fsm-state.sleep .dot { background: var(--ink-faint); }
+  .fsm-state.field .dot,
+  .fsm-state.barn  .dot { background: var(--good); }
+  .fsm-state.load  .dot { background: var(--warn); }
+  .fsm-state.eco   .dot { background: var(--phos); }
+  .fsm-state.wait  .dot { background: var(--crit); }
+  .fsm-arrow { color: var(--ink-faint); font-family: var(--mono); font-size: .8rem; padding: 0 .15rem; }
+  .fsm-state.active {
+    color: var(--ink); border-color: var(--phos); background: color-mix(in srgb, var(--phos) 12%, var(--panel-2));
+    box-shadow: 0 0 14px -3px color-mix(in srgb, var(--phos) 60%, transparent);
+  }
+  .fsm-trans { font-family: var(--mono); font-size: .68rem; color: var(--ink-faint); line-height: 1.6; }
+  .fsm-trans b { color: var(--phos); }
+  .fsm-legend { font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); }
+
+  /* Demo · step-by-step */
+  .demo-lead { font-size: .84rem; color: var(--ink-dim); line-height: 1.45; }
+  .demo-lead b { color: var(--phos); }
+  .demo-scenarios { display: flex; gap: .85rem; flex-wrap: wrap; }
+  .scenario { flex: 1; min-width: 260px; background: var(--panel-2); border: 1px solid var(--edge); border-radius: 8px; padding: .8rem .9rem; }
+  .scenario > .tag {
+    display: inline-flex; align-items: center; gap: .4rem;
+    font-family: var(--mono); font-size: .62rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+    padding: .2rem .55rem; border-radius: 999px; margin-bottom: .55rem;
+  }
+  .scenario.eco   > .tag { color: var(--good); border: 1px solid color-mix(in srgb, var(--good) 55%, var(--edge-hi)); }
+  .scenario.night > .tag { color: var(--phos); border: 1px solid color-mix(in srgb, var(--phos) 55%, var(--edge-hi)); }
+  ol.steps { margin: 0; padding-left: 1.4rem; display: flex; flex-direction: column; gap: .5rem; }
+  ol.steps > li { font-size: .82rem; line-height: 1.5; color: var(--ink); }
+  ol.steps > li::marker { color: var(--phos); font-family: var(--mono); font-weight: 700; }
+  ol.steps .state { color: var(--phos); font-weight: 600; }
+  ol.steps ul.sub { margin: .4rem 0 0; padding-left: 1.1rem; list-style: none; display: flex; flex-direction: column; gap: .3rem; }
+  ol.steps ul.sub > li { font-family: var(--mono); font-size: .74rem; color: var(--ink-dim); }
+  ol.steps ul.sub > li::before { content: "→ "; color: var(--ink-faint); }
+  ol.steps ul.sub b.sunrise { color: var(--warn); }
+  ol.steps ul.sub b.night { color: var(--phos); }
+
   /* IR remote debug panel */
   .remote-wrap { display: flex; gap: 1.2rem; flex-wrap: wrap; }
   .remote-grid {
@@ -308,6 +365,8 @@
   /* Sensor test bench */
   .ctl.live-on { background: var(--phos); color: #04222a; border-color: var(--phos); }
   .ctl.live-on:hover:not(:disabled) { filter: brightness(1.08); color: #04222a; }
+  .ctl.eco-on { background: var(--warn); color: #2a1c04; border-color: var(--warn); }
+  .ctl.eco-on:hover:not(:disabled) { filter: brightness(1.08); color: #2a1c04; }
   .test-head { display: flex; align-items: center; gap: .6rem; }
   .test-head h2 { margin-right: auto; }
   .live-tag {
@@ -371,6 +430,58 @@
   </div>
 
   <div class="grid">
+    <!-- Demo · mission brief + FSM (prototype context for demo day) -->
+    <section class="card col-12" style="order:0">
+      <div class="mission-head">
+        <span class="grp">Group 8</span>
+        <span class="ttl">The Solar-Powered Farm Harvester</span>
+      </div>
+      <p class="mission-brief">
+        An agricultural robot that transports freshly picked fruit from the <b>fields</b> to the
+        <b>barn</b>, relying on <b>solar power</b>. This dashboard drives the live prototype — the
+        mecanum car below runs the finite-state machine, streaming its state and sensors over WiFi.
+      </p>
+
+      <h2 style="margin-top:.3rem">Finite-state machine</h2>
+      <div class="fsm-flow">
+        <span class="fsm-state sleep active" data-fsm="sleep"><span class="dot"></span>Sleep Mode</span>
+        <span class="fsm-arrow">→</span>
+        <span class="fsm-state field" data-fsm="field"><span class="dot"></span>Moving to Field</span>
+        <span class="fsm-arrow">→</span>
+        <span class="fsm-state load" data-fsm="load"><span class="dot"></span>Loading</span>
+        <span class="fsm-arrow">→</span>
+        <span class="fsm-state barn" data-fsm="barn"><span class="dot"></span>Moving to Barn</span>
+        <span class="fsm-arrow">⇄</span>
+        <span class="fsm-state eco" data-fsm="eco"><span class="dot"></span>Eco-Mode</span>
+        <span class="fsm-arrow">→</span>
+        <span class="fsm-state wait" data-fsm="wait"><span class="dot"></span>Waiting for Extraction</span>
+      </div>
+      <div class="fsm-trans">
+        <b>Start:</b> Sleep Mode conserves battery ·
+        <b>Trigger:</b> light sensor detects sunrise → Moving to Field ·
+        <b>Load:</b> waits until weight sensor trips (bin full) → Moving to Barn ·
+        <b>Power:</b> solar input drops (cloud) mid-transit → Eco-Mode (slower, non-essential sensors off) ·
+        <b>Done:</b> at barn → Waiting for Extraction, signals gantry arm → after transfer, if past sunset → Sleep Mode, else → Moving to Field.
+      </div>
+
+      <h2 style="margin-top:.3rem">Demo · step-by-step</h2>
+      <ol class="steps">
+        <li><span class="state">Sleep Mode</span> (battery conserving) → <b>sunrise</b> detected by light sensor: jitter/init all components → transition to <span class="state">Moving to Field</span>.</li>
+        <li>At the field, enters <span class="state">Loading</span>: waits until the farmer fills the bin. Once the <b>weight sensor</b> trips (bin full) → <span class="state">Moving to Barn</span>, then turns and transits back.
+          <ul class="sub">
+            <li>If a cloud drops solar input mid-transit → <b class="night">Eco-Mode</b>: moves slower, non-essential sensors off.</li>
+          </ul>
+        </li>
+        <li>Arrives at the barn and stops → <span class="state">Waiting for Extraction</span> → transmits ready signal to the gantry arm → arm lifts the fruit out of the bin without bruising and signals transfer complete.
+          <ul class="sub">
+            <li>If <b class="night">after sunset</b> → go to Sleep Mode.</li>
+            <li>If <b class="sunrise">still daylight</b> → return to the field.</li>
+          </ul>
+        </li>
+      </ol>
+      <div class="fsm-legend">Live prototype: the mecanum car maps "field → barn" onto its grid (COLLECTING AREA → DROP zone). Watch the console and live map below as it runs.</div>
+    </section>
+
     <!-- Control panel (ordered below the live-monitoring rows) -->
     <section class="card col-12" id="controlCard" style="order:3">
       <h2>Manual control · step debug</h2>
@@ -420,6 +531,9 @@
           </div>
           <div class="ctl-row">
             <button class="ctl" id="liveBtn" disabled title="Stream ultrasonic + color every 250ms for sensor testing">◉ Live readings: OFF</button>
+          </div>
+          <div class="ctl-row">
+            <button class="ctl" id="ecoBtn" disabled title="Simulate a cloud dropping solar input: slower motion, non-essential sensors off (Group 8 FSM)">☁ Eco-Mode: OFF</button>
           </div>
           <div class="ctl-row">
             <button class="ctl" data-cmd="RESET" disabled title="Reset grid coordinates to home">⌂ Reset coords</button>
@@ -641,6 +755,8 @@
       connectBtn.classList.add("primary");
       setControlsEnabled(false);
       setLiveStreaming(false); // stream state is unknown once the link drops
+      setFsm("sleep");         // link down → fall back to the FSM start state
+      setEco(false);
       clearInterval(tickHandle);
       ws = null;
       if (!manualClose) scheduleReconnect();
@@ -702,6 +818,22 @@
     const next = !liveStreaming;
     sendCmd("TELEMETRY:" + (next ? 1 : 0));
     setLiveStreaming(next);
+  });
+
+  // Eco-Mode: simulates the Group 8 "cloud drops solar input" transition. The
+  // firmware slows forward motion and shuts off non-essential sensors; it also
+  // echoes "[SYSTEM] Eco-Mode ENGAGED/CLEARED", which drives the FSM chip.
+  let ecoOn = false;
+  function setEco(on) {
+    ecoOn = on;
+    const btn = $("ecoBtn");
+    btn.classList.toggle("eco-on", on);
+    btn.textContent = on ? "☁ Eco-Mode: ON" : "☁ Eco-Mode: OFF";
+  }
+  $("ecoBtn").addEventListener("click", () => {
+    const next = !ecoOn;
+    sendCmd("ECO:" + (next ? 1 : 0));
+    setEco(next);
   });
   document.querySelectorAll("#controlCard .seg button").forEach((b) => {
     b.addEventListener("click", () => {
@@ -880,10 +1012,38 @@
     $("trailLine").setAttribute("points", "");
   }
 
+  // ── FSM state chips (Group 8 mission mapped onto the live firmware) ──
+  // The firmware emits routine tags ([SEARCH], [RETURN], …), not literal FSM
+  // names, so map each cue onto the demo state it represents. Literal names are
+  // matched too, so printing "Eco-Mode" from firmware would light it directly.
+  let fsmState = "sleep"; // matches the initially-active chip in the FSM flow
+  function setFsm(key) {
+    if (!key || key === fsmState) return;
+    fsmState = key;
+    document.querySelectorAll(".fsm-state").forEach((el) => {
+      el.classList.toggle("active", el.dataset.fsm === key);
+    });
+  }
+  // Ordered rules — first match wins. More specific cues come first.
+  // NOTE: "SOFTWARE DISABLED" fires on every normal grab (holding an item), so it
+  // is deliberately NOT an eco cue — only the explicit "Eco-Mode ENGAGED" line is.
+  const FSM_RULES = [
+    [/Waiting for Extraction|Drop zone reached|Drop node .* reached|releasing grip/i, "wait"],
+    [/Eco-?Mode ENGAGED|non-essential sensors off/i,                                  "eco"],
+    [/Eco-?Mode CLEARED|solar restored|Moving to Barn|\[RETURN\]|Home Node Reached|Home .* reached|Aligning to EAST/i, "barn"],
+    [/Loading|weight sensor|bin full|\[GRAB\]|\[GRIPPER\]/i,                          "load"],
+    [/Moving to Field|\[SEARCH\]|Target Node Reached|Aligning to WEST/i,              "field"],
+    [/Sleep Mode|Robot Halted|EMERGENCY STOP|\[BOOT\]|^===/i,                         "sleep"],
+  ];
+  function detectFsm(text) {
+    for (const [re, key] of FSM_RULES) { if (re.test(text)) { setFsm(key); return; } }
+  }
+
   // ── parse one firmware line ──
   function handleLine(text) {
     lines++;
     $("lineCount").textContent = lines;
+    detectFsm(text);
 
     let cls = "";
     let pm = text.match(/^\[POS\]\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*([0-3])/);

@@ -73,6 +73,13 @@ volatile bool emergencyStopActive = false;
 // Enable/disable verbose sensor telemetry prints (distance/color over serial).
 // Toggle at runtime with the serial "TELEMETRY"/"TEL" command.
 bool debugTelemetry = false;
+// Eco-Mode (Group 8 FSM): simulates "a cloud drops solar input mid-transit."
+// When engaged the car moves slower and shuts off non-essential sensors
+// (ultrasonic/color); line sensors stay on since navigation needs them.
+// Toggle at runtime with the "ECO"/"ECO:0"/"ECO:1" command. ecoBypass lets the
+// spin helpers keep full, calibrated rotation speed while eco is engaged.
+bool ecoMode = false;
+bool ecoBypass = false;
 unsigned long lastTelemetryMillis = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 1000; // ms between automatic reports
 
@@ -250,7 +257,19 @@ void motionTelemetryTick(unsigned long &lastTelemetryMillis) {
 }
 
 
+// Eco-Mode slowdown: ~30% off, floored at APPROACH_SPEED_FLOOR so the motors
+// still physically move (below ~34 they stall). Returns the speed unchanged
+// when eco is off. Rotations pass through gridSetSpeed with ecoBypass set, so
+// timed 90 turns keep their calibrated SPEED_ROTATE.
+uint8_t ecoSpeed(uint8_t s) {
+    if (!ecoMode) return s;
+    int reduced = (int)s * 7 / 10;
+    if (reduced < APPROACH_SPEED_FLOOR) reduced = APPROACH_SPEED_FLOOR;
+    return (uint8_t)reduced;
+}
+
 void gridSetSpeed(uint8_t targetSpeed) {
+    if (!ecoBypass) targetSpeed = ecoSpeed(targetSpeed);
     speed_Upper_L = targetSpeed; speed_Lower_L = targetSpeed;
     speed_Upper_R = targetSpeed; speed_Lower_R = targetSpeed;
 }
@@ -262,6 +281,7 @@ void gridSetSpeed(uint8_t targetSpeed) {
 // that reads as jerky when it fires every sensor tick during a line-follow.
 // steerLeft=true arcs left (drifting back rightward), false arcs right.
 void gridSteer(uint8_t baseSpeed, uint8_t boost, bool steerLeft) {
+    baseSpeed = ecoSpeed(baseSpeed);
     uint8_t outer = (uint8_t)min(255, baseSpeed + boost);
     uint8_t inner = baseSpeed;
     if (steerLeft) {
@@ -279,8 +299,10 @@ void gridStop() {
     Bridge.println(F("[SYSTEM] Robot Halted."));
 }
 
-void spinRightInPlace(uint8_t speed) { gridSetSpeed(speed); mecCar.Turn_Right(); }
-void spinLeftInPlace(uint8_t speed) { gridSetSpeed(speed); mecCar.Turn_Left(); }
+// Spins bypass the eco slowdown: the 90 turns are timed against SPEED_ROTATE,
+// so slowing them would throw off the turn angle.
+void spinRightInPlace(uint8_t speed) { ecoBypass = true; gridSetSpeed(speed); ecoBypass = false; mecCar.Turn_Right(); }
+void spinLeftInPlace(uint8_t speed) { ecoBypass = true; gridSetSpeed(speed); ecoBypass = false; mecCar.Turn_Left(); }
 
 void disableSensors() {
     sensorsEnabled = false;
@@ -1034,8 +1056,8 @@ int searchAndGrab(int targetColour, int startRow) {
 // after the grab with the car at column 2, currentY = the grabbed row, facing
 // WEST (block held in front). Route: back off to the block's junction, reverse
 // one more node east onto the clear X=3 corridor (still WEST-facing — no turn),
-// funnel onto the central row 3 ("path 2"), then run east to home and out to the
-// drop.
+// funnel onto the central row 3 ("path 2"), then run east through home out to
+// the drop node (9,3), where the caller releases the grip.
 //
 // Turning: a block from row 1 or row 5 reaches row 3 with one 90° turn onto the
 // corridor and another 90° to face east — never a 180°. A block already on row 3
@@ -1065,11 +1087,13 @@ static void carryHomeViaRow3() {
         }
     }
 
-    // Face east and run along row 3 back to home (X=7). From row 1/5 this is a
-    // 90° turn; from row 3 (path 2) it is the one 180° the route allows.
+    // Face east and run along row 3 all the way out to the drop node (9,3):
+    // through home (X=7) and two more nodes east into the START zone, where the
+    // grip is released. From row 1/5 the turn onto east is a 90°; from row 3
+    // (path 2) it is the one 180° the route allows.
     turnToHeading(EAST);
     if (emergencyStopActive) return;
-    while (currentX < 7) {
+    while (currentX < 9) {
         if (checkEmergencyStop()) return;
         gridMoveForwardOneCoord(SPEED_START_FAST);
         if (emergencyStopActive) return;
@@ -1077,8 +1101,41 @@ static void carryHomeViaRow3() {
         reportPosition();
     }
 
-    Bridge.println(F("[RETURN] Home reached via row 3 — heading to drop."));
-    goToDrop();                     // line-follow east from home out to the drop zone
+    Bridge.println(F("[RETURN] Drop node (9,3) reached — releasing grip."));
+    gridStop();                     // stop on (9,3); caller opens the claw here
+}
+
+// After releasing the block at the drop node (9,3), drive back home to (7,3):
+// reverse a little so the in-place 180° spin doesn't sweep the claw into the
+// just-dropped block, turn 180° to face WEST, then line-follow the two nodes
+// west onto home. Called after the claw has opened and the block is clear for
+// the robot arm to pick up. Entered at (9,3) facing EAST.
+static void returnHomeFromDrop() {
+    if (checkEmergencyStop()) return;
+
+    // Back off the drop point so the 180° spin clears the dropped block.
+    Bridge.println(F("[RETURN] Backing off the drop point before turning home..."));
+    gridSetSpeed(SPEED_REVERSE_BUMP);
+    mecCar.Back();
+    unsigned long t0 = millis();
+    while (millis() - t0 < REVERSE_BUMP_MS) { if (checkEmergencyStop()) return; }
+    gridStop();
+
+    // Spin 180° in place to face home (EAST -> WEST): turnToHeading takes the
+    // short way, which for a 180 is two left-90 spins.
+    turnToHeading(WEST);
+    if (emergencyStopActive) return;
+
+    // Line-follow west back onto home (7,3), one node at a time.
+    while (currentX > 7) {
+        if (checkEmergencyStop()) return;
+        gridMoveForwardOneCoord(SPEED_START_FAST);
+        if (emergencyStopActive) return;
+        currentX -= 1;
+        reportPosition();
+    }
+    gridStop();
+    Bridge.println(F("[RETURN] Home (7,3) reached."));
 }
 
 // Full mission with colour search: hunt the target colour across the 3 blocks,
@@ -1105,7 +1162,10 @@ void searchGrabAndDrop(int targetColour, int startRow) {
     carryHomeViaRow3();
     if (emergencyStopActive) return;
     delay(300);
-    openClawWithAttach();          // release at the drop zone
+    openClawWithAttach();          // release the block at the drop node (9,3)
+    delay(300);
+    returnHomeFromDrop();          // reverse, spin 180°, drive back to home (7,3)
+    if (emergencyStopActive) return;
     resetCoordinates();
 }
 
@@ -1114,28 +1174,35 @@ enum Action { FWD, LFT, RGT, GRB, REV, DRP, GDR, DLY };
 struct Step { Action act; uint8_t arg; };
 
 const Step path1[] = {
-    {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
-    // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
-    // straight line-follow run so the car re-centers after the RGT turn before the
-    // ultrasonic creeps the last stretch onto the block at column 1.
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, {RGT, 0},
-    {DLY, 5}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
+    // Outbound via column 4: FWD 3 = col 7->4, drop to row 1 at col 4, then
+    // FWD 3 = col 4->1 gives a straight line-follow run so the car re-centers
+    // after the RGT turn before the ultrasonic creeps onto the block at column 1.
+    {FWD, 3}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
+    {FWD, 3}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    // No 180: back off the block, single RGT to face row 3, cross to row 3,
+    // then RGT east and run the row-3 corridor. FWD 8 counts columns 2..9 so
+    // the car stops ON the drop node (9,3) and releases the block there.
+    {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 
 const Step path2[] = {
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3}, 
-    {RGT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
+    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    // FWD 8 counts columns 2..9 so the car stops ON the drop node (9,3) and
+    // releases the block there.
+    {RGT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 //GDR was = 0
 const Step path3[] = {
-    {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
-    // Approach from column 5 (turn stays at col 5). FWD 4 = col 5->1 gives a long
-    // straight line-follow run so the car re-centers after the LFT turn before the
-    // ultrasonic creeps the last stretch onto the block at column 1 (mirror of path1).
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {LFT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},{LFT, 0},
-    {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},{FWD, 5}, {DLY, 2},{DRP, 0},
+    // Outbound via column 4 (mirror of path1): FWD 3 = col 7->4, rise to row 5
+    // at col 4, then FWD 3 = col 4->1 straight run before the grab approach.
+    {FWD, 3}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
+    {FWD, 3}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    // No 180: back off the block, single LFT to face row 3, cross to row 3,
+    // then LFT east and run the row-3 corridor. FWD 8 counts columns 2..9 so
+    // the car stops ON the drop node (9,3) and releases the block there.
+    {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 
@@ -1300,6 +1367,18 @@ void handleSerialCommand() {
     } else if (verb == "RESET") {
         resetCoordinates();
         Bridge.println(F("[ACK] RESET coordinates"));
+    } else if (verb == "ECO") {
+        // Simulate the solar-power FSM transition: a cloud drops solar input, so
+        // the harvester drops into Eco-Mode (slower, non-essential sensors off).
+        // ECO with no arg toggles; ECO:0 / ECO:1 set off / on explicitly.
+        if (line.indexOf(':') >= 0) ecoMode = (arg != 0);
+        else ecoMode = !ecoMode;
+        if (ecoMode) {
+            sensorsEnabled = false;   // ultrasonic + color off; line sensors stay on
+            Bridge.println(F("[SYSTEM] Eco-Mode ENGAGED — solar input low: moving slower, non-essential sensors off."));
+        } else {
+            Bridge.println(F("[SYSTEM] Eco-Mode CLEARED — solar restored: resuming normal speed."));
+        }
     } else if (verb == "TELEMETRY" || verb == "TEL") {
         // TELEMETRY with no arg toggles, with arg 0/1 sets off/on
         if (line.indexOf(':') >= 0) {
