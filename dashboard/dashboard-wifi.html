@@ -330,6 +330,26 @@
     letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint);
   }
   .test-cell .age { font-family: var(--mono); font-size: .58rem; color: var(--ink-faint); margin-top: auto; }
+
+  /* Live map */
+  .map-wrap { display: flex; justify-content: center; }
+  #mapSvg { width: 100%; max-width: 340px; height: auto; }
+  #mapSvg .gridline { stroke: var(--edge-hi); stroke-width: 2; }
+  #mapSvg .node { fill: var(--ink-faint); }
+  #mapSvg .startzone { fill: color-mix(in srgb, var(--phos) 8%, transparent); }
+  #mapSvg .nogo { fill: color-mix(in srgb, var(--crit) 20%, transparent); }
+  #mapSvg .nogo-edge { fill: none; stroke: var(--crit); stroke-width: 2; stroke-dasharray: 5 3; opacity: .85; }
+  #mapSvg .lbl { font-family: var(--mono); font-size: 9px; fill: var(--ink-faint); letter-spacing: .08em; }
+  #mapSvg .lbl.area { font-size: 8px; fill: var(--ink-dim); letter-spacing: .1em; }
+  #mapSvg .axlbl { font-family: var(--mono); font-size: 7px; fill: var(--ink-faint); }
+  #mapSvg .axcap { font-family: var(--mono); font-size: 7px; fill: var(--phos); font-weight: 700; }
+  #mapSvg .home { fill: none; stroke: var(--phos); stroke-width: 2; }
+  #mapSvg .blockm { stroke-width: 1.5; }
+  #mapSvg .dropzone { fill: none; stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  #mapSvg #trailLine { fill: none; stroke: var(--phos); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .45; }
+  #mapSvg #robotG { transition: transform .6s ease; }
+  #mapSvg .robot-body { fill: color-mix(in srgb, var(--phos) 30%, var(--panel)); stroke: var(--phos); stroke-width: 2; }
+  #mapSvg .robot-nose { fill: var(--phos); }
 </style>
 
 <header>
@@ -495,6 +515,16 @@
           <div class="age" id="irAge">waiting for a press</div>
         </div>
       </div>
+    </section>
+
+    <!-- Live map -->
+    <section class="card col-6">
+      <h2>Live map · tracked pose</h2>
+      <div class="map-wrap">
+        <svg id="mapSvg" viewBox="0 0 326 202" role="img" aria-label="grid map with robot position"></svg>
+      </div>
+      <div class="stat-row" style="border:0; padding:0;"><span class="k">pose (x, y · heading)</span><span class="v" id="poseVal">7, 3 · WEST</span></div>
+      <div class="ctl-note">6×6 collecting grid · 2×3 START corridor · drop area next to it. Red band = no-go perimeter (car stays one line in from every edge). Driven by firmware <b>[POS]</b> lines — updates on coordinate-tracked moves (SEARCH missions, Reset coords); scripted paths 1–3 don't report position</div>
     </section>
 
     <!-- Line sensors -->
@@ -735,12 +765,153 @@
     dot.className = "conn-dot" + (cls ? " " + cls : "");
   }
 
+  // ── Live map ──────────────────────────────────────────────────────────────
+  // Mirrors the physical mat: a 6×6 COLLECTING grid (junction nodes X 0–6,
+  // Y 0–6) on the west/left, with a 3×2 START zone EXTENDING east out of its
+  // right edge (nodes X 6–9, Y 2–4) and the DROPPING AREA right next to it
+  // (X 9–10). The car's tracked home is node (7,3), inside the START zone; the
+  // three blocks sit at column X=1, rows Y=1/3/5. X increases east, Y north.
+  const MAP = { CELL: 28, ML: 30, MT: 14 };
+  const COLL = { x0: 0, x1: 6, y0: 0, y1: 6 };    // 6×6 collecting grid
+  // START zone: 3 wide × 2 tall (nodes X 6–9, Y 2–4), extends east of the
+  // collecting grid's right edge (X 6). Home (7,3) is inside it.
+  const START = { x0: 6, x1: 9, y0: 2, y1: 4 };
+  const DROP = { x0: 9, x1: 10, y0: 2, y1: 4 };   // dropping area, next to START
+  // Keep-out border: the car must stay one node in from every edge — its
+  // tracked node is clamped to X 1..8, Y 1..5 (mirrors GRID_MIN/MAX_* in
+  // FinalSequence.cpp). Drawn as a dashed red box over the collecting interior.
+  const BORDER = { minX: 1, maxX: 5, minY: 1, maxY: 5 };
+  const HEADING_NAMES = ["NORTH", "EAST", "SOUTH", "WEST"];
+  const mapPx = (x) => MAP.ML + x * MAP.CELL;
+  const mapPy = (y) => MAP.MT + (COLL.y1 - y) * MAP.CELL;   // north (higher y) is up
+  let trailPts = [];
+
+  function svgEl(tag, attrs, text) {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (text) el.textContent = text;
+    return el;
+  }
+
+  const gline = (x1, y1, x2, y2) => svgEl("line", { class: "gridline", x1, y1, x2, y2 });
+
+  function buildMap() {
+    const svg = $("mapSvg");
+
+    // START corridor shading (drawn first, under the grid lines)
+    svg.append(svgEl("rect", {
+      class: "startzone",
+      x: mapPx(START.x0), y: mapPy(START.y1),
+      width: (START.x1 - START.x0) * MAP.CELL, height: (START.y1 - START.y0) * MAP.CELL,
+    }));
+
+    // COLLECTING grid lines (6×6 cells → nodes 0..6)
+    for (let x = COLL.x0; x <= COLL.x1; x++) svg.append(gline(mapPx(x), mapPy(COLL.y1), mapPx(x), mapPy(COLL.y0)));
+    for (let y = COLL.y0; y <= COLL.y1; y++) svg.append(gline(mapPx(COLL.x0), mapPy(y), mapPx(COLL.x1), mapPy(y)));
+    // START corridor grid lines — extend east of the collecting right edge
+    for (let x = START.x0 + 1; x <= START.x1; x++) svg.append(gline(mapPx(x), mapPy(START.y1), mapPx(x), mapPy(START.y0)));
+    for (let y = START.y0; y <= START.y1; y++) svg.append(gline(mapPx(START.x0), mapPy(y), mapPx(START.x1), mapPy(y)));
+
+    // junction nodes
+    for (let x = COLL.x0; x <= COLL.x1; x++)
+      for (let y = COLL.y0; y <= COLL.y1; y++)
+        svg.append(svgEl("circle", { class: "node", cx: mapPx(x), cy: mapPy(y), r: 2.3 }));
+    for (let x = START.x0 + 1; x <= START.x1; x++)
+      for (let y = START.y0; y <= START.y1; y++)
+        svg.append(svgEl("circle", { class: "node", cx: mapPx(x), cy: mapPy(y), r: 2.3 }));
+
+    // ── coordinate axes ──
+    for (let x = COLL.x0; x <= DROP.x1; x++)
+      svg.append(svgEl("text", { class: "axlbl", x: mapPx(x), y: mapPy(0) + 13, "text-anchor": "middle" }, x));
+    for (let y = COLL.y0; y <= COLL.y1; y++)
+      svg.append(svgEl("text", { class: "axlbl", x: mapPx(0) - 13, y: mapPy(y) + 3, "text-anchor": "middle" }, y));
+    svg.append(svgEl("text", { class: "axcap", x: mapPx(DROP.x1) + 6, y: mapPy(0) + 13 }, "X→"));
+    svg.append(svgEl("text", { class: "axcap", x: mapPx(0) - 22, y: mapPy(6) - 5 }, "Y↑"));
+
+    // NO-GO perimeter band: the outermost ring of the collecting grid is
+    // off-limits — the car must stay one node in from every edge. Drawn as
+    // one-cell-thick red bands on each side. The EAST edge is left OPEN at
+    // Y2–4 (a two-cell gap) where the START zone joins, so the home↔blocks
+    // lane passes through freely. (Firmware clamps the tracked node so it can
+    // never enter these bands.)
+    const C = MAP.CELL;
+    const nogoBand = (x, y, w, h) => svg.append(svgEl("rect", { class: "nogo", x, y, width: w, height: h }));
+    nogoBand(mapPx(0), mapPy(6), C, 6 * C);        // west  (X0–1)
+    nogoBand(mapPx(0), mapPy(6), 6 * C, C);        // north (Y5–6)
+    nogoBand(mapPx(0), mapPy(1), 6 * C, C);        // south (Y0–1)
+    nogoBand(mapPx(5), mapPy(6), C, 2 * C);        // east upper (Y4–6)
+    nogoBand(mapPx(5), mapPy(2), C, 2 * C);        // east lower (Y0–2)
+
+    // COLLECTING AREA label (top-left, inside the grid)
+    svg.append(svgEl("text", { class: "lbl area", x: mapPx(0) + 4, y: mapPy(6) - 6 }, "COLLECTING AREA"));
+
+    // block positions (nodes (1,1),(1,3),(1,5)) — outlined squares on the nodes
+    [[1, "#e35d6a"], [3, "#4d8fe1"], [5, "#e6c34d"]].forEach(([y, c]) => {
+      svg.append(svgEl("rect", {
+        class: "blockm", x: mapPx(1) - 6, y: mapPy(y) - 6, width: 12, height: 12, rx: 2,
+        fill: "color-mix(in srgb, " + c + " 30%, transparent)", stroke: c,
+      }));
+    });
+
+    // START zone danger band: no-go walls on its two long edges (north Y4,
+    // south Y2). Open on the west (joins the collecting grid, where home sits)
+    // and east (opens to the DROP zone). The car keeps to the Y=3 lane through.
+    const sL = mapPx(START.x0), sR = mapPx(START.x1), sT = mapPy(START.y1), sB = mapPy(START.y0), BAND = 5;
+    svg.append(svgEl("rect", { class: "nogo", x: sL, y: sT, width: sR - sL, height: BAND }));        // north
+    svg.append(svgEl("rect", { class: "nogo", x: sL, y: sB - BAND, width: sR - sL, height: BAND }));  // south
+
+    // START zone label + home node (7,3), inside the zone
+    const scx = (mapPx(START.x0) + mapPx(START.x1)) / 2;
+    svg.append(svgEl("text", { class: "lbl", x: scx, y: mapPy(START.y1) - 5, "text-anchor": "middle" }, "START"));
+    svg.append(svgEl("rect", { class: "home", x: mapPx(7) - 8, y: mapPy(3) - 8, width: 16, height: 16, rx: 4 }));
+    svg.append(svgEl("text", { class: "lbl", x: mapPx(7), y: mapPy(3) + 18, "text-anchor": "middle" }, "HOME"));
+
+    // DROPPING AREA — rounded zone right next to (east of) the corridor
+    svg.append(svgEl("rect", {
+      class: "dropzone", x: mapPx(DROP.x0) + 4, y: mapPy(DROP.y1),
+      width: (DROP.x1 - DROP.x0) * MAP.CELL - 6, height: (DROP.y1 - DROP.y0) * MAP.CELL, rx: 8,
+    }));
+    const dcx = mapPx(DROP.x0) + (DROP.x1 - DROP.x0) * MAP.CELL / 2;
+    svg.append(svgEl("text", {
+      class: "lbl", x: dcx, y: mapPy(2.5) + 3, "text-anchor": "middle",
+      transform: "rotate(90 " + dcx + " " + (mapPy(2.5) + 3) + ")",
+    }, "DROP"));
+
+    // trail + robot marker (nose points NORTH at rotation 0)
+    svg.append(svgEl("polyline", { id: "trailLine", points: "" }));
+    const g = svgEl("g", { id: "robotG" });
+    g.append(svgEl("circle", { class: "robot-body", r: 10 }));
+    g.append(svgEl("path", { class: "robot-nose", d: "M 0 -13 L 5 -5 L -5 -5 Z" }));
+    svg.append(g);
+    updateMap(7, 3, 3, true); // home pose (7,3) facing WEST until the firmware reports
+  }
+
+  function updateMap(x, y, h, skipTrail) {
+    const g = $("robotG");
+    g.style.transform = "translate(" + mapPx(x) + "px," + mapPy(y) + "px) rotate(" + h * 90 + "deg)";
+    $("poseVal").textContent = x + ", " + y + " · " + HEADING_NAMES[h];
+    if (skipTrail) return;
+    const pt = mapPx(x) + "," + mapPy(y);
+    if (trailPts[trailPts.length - 1] !== pt) {
+      trailPts.push(pt);
+      if (trailPts.length > 80) trailPts.shift();
+      $("trailLine").setAttribute("points", trailPts.join(" "));
+    }
+  }
+
+  function resetTrail() {
+    trailPts = [];
+    $("trailLine").setAttribute("points", "");
+  }
+
   // ── parse one firmware line ──
   function handleLine(text) {
     lines++;
     $("lineCount").textContent = lines;
 
     let cls = "";
+    let pm = text.match(/^\[POS\]\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*([0-3])/);
+    if (pm) { updateMap(+pm[1], +pm[2], +pm[3]); logLine(text, "nav"); return; }
     let sm = text.match(/^\[ACK\]\s*SENSORS\s+L=(\d)\s+C=(\d)\s+R=(\d)/i);
     if (sm) { updateLamps(sm[1] === "1", sm[2] === "1", sm[3] === "1"); logLine(text, "ack"); return; }
     if (/^\[ACK\]/i.test(text)) {
@@ -781,7 +952,7 @@
       cls = "sys";
       if (/Halted/i.test(text)) setAction("Halted", "idle", "robot stopped");
       else if (/Drop zone/i.test(text)) setAction("Drop zone", "nav", "reached drop zone");
-      else if (/Reset/i.test(text)) { setEstop(false); setAction("Idle", "idle", "tracker reset to home"); }
+      else if (/Reset/i.test(text)) { setEstop(false); setAction("Idle", "idle", "tracker reset to home"); resetTrail(); }
       else if (/DISABLED/i.test(text)) $("lastEvent").textContent = "sensors disabled (item held)";
     } else if (/^===/.test(text)) {
       cls = "sys"; setEstop(false); setAction("Ready", "idle", "controller booted");
@@ -889,6 +1060,7 @@
 
   $("clearBtn").addEventListener("click", () => { consoleEl.innerHTML = ""; });
 
+  buildMap();
   connect();
   window.addEventListener("beforeunload", () => { manualClose = true; if (ws) ws.close(); });
 })();

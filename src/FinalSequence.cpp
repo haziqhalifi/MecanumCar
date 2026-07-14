@@ -77,9 +77,34 @@ unsigned long lastTelemetryMillis = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 1000; // ms between automatic reports
 
 // ── Global Position and Heading Tracking ────────────────────────────────────
-int currentX = 4, currentY = 3;
+// Home/start is node (7,3): the car begins in the START zone, which sits east
+// of the 6×6 collecting grid. A SEARCH mission drives 6 junctions west from
+// here (X7→X1) to reach the blocks at column X=1, rows Y=1/3/5.
+int currentX = 7, currentY = 3;
 const int NORTH = 0, EAST = 1, SOUTH = 2, WEST = 3;
 int currentHeading = WEST;
+
+// ── Grid Boundary (keep-out border) ─────────────────────────────────────────
+// The playable area is a 6×6 collecting grid (junction nodes 0..6) plus a 3×2
+// START zone extending east of its right edge (nodes X 6..9, Y 2..4), home at
+// (7,3). The car must NOT drive onto the outermost line on any side — it stays
+// one node in from every edge. Tracked node is clamped to X 1..8, Y 1..5:
+// X=1 = block column (car stops here, claw reaches the west edge), X=8 keeps it
+// one in from the START zone's east edge (X9); Y 1..5 is one in from the
+// collecting top/bottom. moveCoord() clamps every target so the car can never
+// be commanded onto or past the outer boundary line.
+const int GRID_MIN_X = 1, GRID_MAX_X = 8;
+const int GRID_MIN_Y = 1, GRID_MAX_Y = 5;
+
+// Emit the tracked pose over both serial links so the dashboard's live map can
+// draw the robot. Format: "[POS] x,y,h" with h = 0..3 (NORTH/EAST/SOUTH/WEST).
+// Called every time currentX/currentY/currentHeading changes.
+void reportPosition() {
+    Bridge.print(F("[POS] "));
+    Bridge.print(currentX); Bridge.print(F(","));
+    Bridge.print(currentY); Bridge.print(F(","));
+    Bridge.println(currentHeading);
+}
 
 
 // ── Tuning Constants ───────────────────────────────────────────────────────
@@ -704,6 +729,7 @@ void turnToHeading(int targetHeading) {
             if (!gridRotateLeft90()) return;
             currentHeading = (currentHeading + 3) % 4;
         }
+        reportPosition();
     }
 }
 
@@ -713,6 +739,18 @@ void turnToHeading(int targetHeading) {
 void moveCoord(int targetX, int targetY) {
     if (checkEmergencyStop()) return;
 
+    int clampedX = constrain(targetX, GRID_MIN_X, GRID_MAX_X);
+    int clampedY = constrain(targetY, GRID_MIN_Y, GRID_MAX_Y);
+    if (clampedX != targetX || clampedY != targetY) {
+        Bridge.print(F("[NAVIGATE] Target ("));
+        Bridge.print(targetX); Bridge.print(F(",")); Bridge.print(targetY);
+        Bridge.print(F(") outside grid bounds — clamped to ("));
+        Bridge.print(clampedX); Bridge.print(F(",")); Bridge.print(clampedY);
+        Bridge.println(F(")."));
+    }
+    targetX = clampedX;
+    targetY = clampedY;
+
     int deltaX = targetX - currentX;
     if (deltaX != 0) {
         turnToHeading((deltaX > 0) ? EAST : WEST);
@@ -721,6 +759,7 @@ void moveCoord(int targetX, int targetY) {
             gridMoveForwardOneCoord(SPEED_START_FAST);
             if (emergencyStopActive) return;
             currentX += (currentHeading == EAST) ? 1 : -1;
+            reportPosition();
         }
     }
 
@@ -732,6 +771,7 @@ void moveCoord(int targetX, int targetY) {
             gridMoveForwardOneCoord(SPEED_START_FAST);
             if (emergencyStopActive) return;
             currentY += (currentHeading == NORTH) ? 1 : -1;
+            reportPosition();
         }
     }
 
@@ -755,7 +795,7 @@ bool moveToGrab(int targetColour, uint8_t approachStartSpeed = SPEED_MIN) {
 
 void moveHome() {
     if (checkEmergencyStop()) return;
-    moveCoord(4, 3); // Leveraging existing moveCoord instead of repeating logic
+    moveCoord(7, 3); // Leveraging existing moveCoord instead of repeating logic
     if (emergencyStopActive) return;
     Bridge.println(F("[NAVIGATE] Home Node Reached. Aligning to EAST baseline..."));
     turnToHeading(EAST);
@@ -794,9 +834,10 @@ void goToDrop() {
 }
 
 void resetCoordinates() {
-    currentX = 4; currentY = 3; currentHeading = WEST;
+    currentX = 7; currentY = 3; currentHeading = WEST;
     emergencyStopActive = false;
-    Bridge.println(F("[SYSTEM] Navigation Tracker Reset to Default Home Baseline (4,3) facing WEST."));
+    Bridge.println(F("[SYSTEM] Navigation Tracker Reset to Default Home Baseline (7,3) facing WEST."));
+    reportPosition();
 }
 
 // ── Color-search across the 3 blocks ─────────────────────────────────────────
@@ -901,7 +942,7 @@ int searchAndGrab(int targetColour, int startRow) {
 void searchGrabAndDrop(int targetColour, int startRow) {
     if (checkEmergencyStop()) return;
     openClawWithAttach();          // start with an open gripper
-    resetCoordinates();            // assume we begin at home (4,3) facing WEST
+    resetCoordinates();            // assume we begin at home (7,3) facing WEST
 
     int grabbedRow = searchAndGrab(targetColour, startRow);
     if (emergencyStopActive) return;
@@ -1164,6 +1205,7 @@ void setup() {
     openClawWithAttach();
 
     Bridge.println(F("=== Turn-Locked Autonomous Controller ==="));
+    reportPosition();   // sync the dashboard map to the home pose at boot
     // Print an immediate telemetry snapshot at startup
     telemetryReport();
     lastTelemetryMillis = millis();
