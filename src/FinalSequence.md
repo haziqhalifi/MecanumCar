@@ -3,8 +3,9 @@
 Firmware for a mecanum-wheel car that line-follows a grid, approaches a colored
 block with the ultrasonic sensor, grabs it (optionally color-selective), and
 carries it to a drop zone. Entry point: [FinalSequence.cpp](FinalSequence.cpp).
-Controlled by IR remote and (for debugging) serial commands — nothing runs
-autonomously until a button is pressed.
+Controlled by IR remote, USB serial, or the [wireless WiFi
+dashboard](#wireless-bridge-and-dashboard) — nothing runs autonomously until a
+button is pressed.
 
 ## Hardware
 
@@ -184,17 +185,104 @@ newline-terminated ASCII (`VERB` or `VERB:arg`); every reply is prefixed
 | `PATH:pc` | Run path `p` (1–3) with color `c` — arg encodes `path*10 + color` |
 | `RESET` | `resetCoordinates()` |
 | `TELEMETRY` / `TEL` (`:0`/`:1` or bare toggle) | Turn distance/color telemetry prints on/off |
+| `SEARCH:cr` | `searchGrabAndDrop(color, startRow)` — the full color-hunt mission, arg encodes `color*10 + startRow` (color 0=RED/1=BLUE/2=YELLOW, startRow 1/3/5). Mirrors the 9 IR mission buttons so each one is individually triggerable and debuggable from a dashboard. |
 
 Any other command while E-STOP is latched is refused until `RESUME`.
 
-## Emergency stop
+`STOP` is special: `checkEmergencyStop()` — the same function polled inside
+every blocking movement loop — also peeks both serial links (USB `Serial` and
+the ESP32 bridge's `espSerial`) for a line starting with `S`. If it reads
+`STOP`, it latches E-STOP immediately, mid-maneuver, exactly like the IR
+remote's `*`. Without this, a `STOP` sent while `gridMoveForwardBlocks()` or
+`runPath()` was blocking would sit unread until `loop()` cycled back to
+`handleSerialCommand()` — i.e. until the current move finished. See
+[Emergency stop](#emergency-stop).
 
-`checkEmergencyStop()` is polled inside every blocking movement loop. If a
-`CMD_STAR` press is decoded (or `STOP` over serial), it sets
-`emergencyStopActive`, calls `gridStop()`, and logs it — every subsequent loop
-iteration of the current maneuver sees the flag and returns early. A fresh
-(non-`*`) IR button press, or `RESUME`/`ARM` over serial, clears the flag and
-re-arms the system.
+## Wireless bridge and dashboard
+
+The car can be driven over WiFi instead of USB. Full hardware/flashing setup
+lives in [esp32-wifi-bridge/README.md](../esp32-wifi-bridge/README.md); this
+section covers how it connects to the firmware above and what the dashboard UI
+exposes.
+
+### Connection path
+
+```
+browser (dashboard-wifi.html)
+   │  WebSocket ws://<esp32-ip>/ws
+   ▼
+ESP32 (esp32-wifi-bridge/src/main.cpp)
+   │  Serial2 @ 9600, forwards text frames verbatim
+   ▼
+Uno espSerial (SoftwareSerial, pins 11 RX / 10 TX) @ 9600
+   │  handleSerialCommand() — same parser as the USB link
+   ▼
+FinalSequence.cpp
+```
+
+- The ESP32 joins WiFi and serves the dashboard page itself (embedded gzipped
+  in `esp32-wifi-bridge/src/dashboard_html.h`, generated from
+  `dashboard/dashboard-wifi.html` — re-run
+  `python3 esp32-wifi-bridge/tools/gen_dashboard_header.py` after editing the
+  HTML, then reflash the ESP32).
+- Button clicks send the exact same newline-terminated commands documented in
+  [Serial command control](#serial-command-control) (`FWD:2`, `SEARCH:11`,
+  `STOP`, …) — the Uno can't tell a wireless command from a USB one.
+- Every line the Uno prints via `Bridge` (both `Serial` and `espSerial`) is
+  read back off Serial2 by the ESP32 and broadcast to all connected browsers,
+  so the dashboard's console/telemetry is the same firmware output the USB
+  Serial Monitor would show.
+- The Uno's `Serial`/`espSerial` are two independent physical links (hardware
+  UART pins 0/1 vs. `SoftwareSerial` on 11/10) but feed the **same**
+  `handleSerialCommand()` parser and the **same** `emergencyStopActive` state
+  — wired debug and wireless dashboard are interchangeable, never both at once
+  on pins 0/1 (USB Serial Monitor open + ESP32 bridge wired in will fight over
+  the Uno's one hardware UART).
+
+### Dashboard panels (`dashboard/dashboard-wifi.html`)
+
+- **Manual control** — one button per serial command (movement, claw, full
+  paths, `PING`/`SENSORS` snapshots, `RESUME`/`RESET`) plus the always-enabled
+  **EMERGENCY STOP** button (`STOP`). A **Live readings** toggle sends
+  `TELEMETRY:1`/`:0` to stream distance + color every 250ms instead of
+  requiring a `PING` click per reading.
+- **IR remote debug** — a 3×3 grid (color × start row) mirroring the 9
+  `searchGrabAndDrop()` mission buttons from the [IR command map](#ir-command-map),
+  each cell sending the matching `SEARCH:cr` command. A physical remote press
+  lights up the matching cell (parsed from the `Key Pressed: N` line the
+  firmware prints) so the same panel doubles as an IR-receiver check — a code
+  arriving with no matching cell shows as "unmapped" rather than silently
+  doing nothing. STOP/`#`/OK are wired the same way; the claw-nudge and
+  creep-grab remote buttons have no serial equivalent and only light up on a
+  physical press (see the `serialStopRequested`/`SEARCH` additions above for
+  why STOP and the 9 missions specifically got serial commands).
+- **Sensor test bench** — ultrasonic, color, and IR readouts side by side,
+  each flashing briefly and stamping "updated at Xs" when a fresh reading
+  lands, so a sensor that's stuck or unplugged is visually obvious (no flash =
+  no data).
+- **Line sensors / current action / session stats / console** — parse the
+  firmware's existing log line prefixes (`[TURN]`, `[NAVIGATE]`, `[GRAB]`,
+  `[SYSTEM]`, `[ACK] SENSORS L=… C=… R=…`, …) into live UI state; no firmware
+  changes were needed for these, they were already being printed.
+
+`checkEmergencyStop()` is polled inside every blocking movement loop. Each
+call checks two independent sources, either of which latches the stop:
+
+1. **IR**: a `CMD_STAR` (`*`) press.
+2. **Serial**: a `STOP` line peeked off `Serial` or `espSerial` (see
+   `serialStopRequested()`) — this is what lets the wireless dashboard's
+   EMERGENCY STOP button interrupt a move that's already in progress, not just
+   block a new one from starting.
+
+Either source sets `emergencyStopActive`, calls `gridStop()`, and logs it —
+every subsequent loop iteration of the current maneuver sees the flag and
+returns early. A fresh (non-`*`) IR button press, or `RESUME`/`ARM` over
+serial, clears the flag and re-arms the system.
+
+`handleSerialCommand()`'s own top-level `STOP` handling (outside the motion
+loops) exists for the case where the car is idle and no blocking loop is
+running to poll `checkEmergencyStop()` — both paths converge on the same
+`emergencyStopActive` flag.
 
 ## Dead code (not reachable from `loop()`)
 
