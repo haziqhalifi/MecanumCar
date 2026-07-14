@@ -204,6 +204,17 @@ const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = 
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 // pulseIn timeout for one color-sensor channel read (microseconds).
 const unsigned long COLOR_PULSE_TIMEOUT_US = 30000UL;
+// The colour sensor only reads the BLOCK reliably when the car is nosed right up
+// to it. Farther out, its wide field of view sees the floor/mat and ambient
+// light instead, and the pulse-width comparison tends to fall to BLUE (smallest
+// channel) even in front of a RED block. So a colour read is only TRUSTED within
+// this distance; beyond it gridDetectColorValue() returns ANY ("unknown") so a
+// far floor reflection can't be mistaken for a real block colour. Keep this at or
+// below GRAB_APPROACH_DISTANCE_CM (the standoff where the real read/grab happens);
+// a hair above it (10) gives a little margin for ultrasonic jitter right at the
+// stop. Tune on the car: raise if valid close reads get rejected, lower if far
+// false colours still leak through.
+const int COLOR_RELIABLE_DISTANCE_CM = 10;
 // Tracks the claw's last commanded angle so the LEFT/RIGHT arrow nudge
 // buttons can step from wherever it currently sits, rather than jumping to
 // an extreme. Kept in sync by openClawWithAttach()/closeClawGrip()/clawNudge().
@@ -250,9 +261,28 @@ void motionTelemetryTick(unsigned long &lastTelemetryMillis) {
 }
 
 
+// Last speed value emitted over telemetry, so gridSetSpeed only prints a
+// "[SPEED] n" line when the commanded speed actually CHANGES. gridSetSpeed is
+// called every motion tick (~every 60ms during an approach); printing every
+// call would flood the serial link and console. Emit-on-change keeps the
+// dashboard's speed readout live without the spam. 255 = "nothing sent yet".
+uint8_t lastSpeedEmitted = 255;
+
+// Emit the current commanded PWM speed to the dashboard, but only when it has
+// changed since the last emit. Shared by gridSetSpeed and gridStop (which
+// reports 0). Skipped entirely during an e-stop.
+void emitSpeedIfChanged(uint8_t speed) {
+    if (emergencyStopActive) return;
+    if (speed == lastSpeedEmitted) return;
+    lastSpeedEmitted = speed;
+    Bridge.print(F("[SPEED] "));
+    Bridge.println(speed);
+}
+
 void gridSetSpeed(uint8_t targetSpeed) {
     speed_Upper_L = targetSpeed; speed_Lower_L = targetSpeed;
     speed_Upper_R = targetSpeed; speed_Lower_R = targetSpeed;
+    emitSpeedIfChanged(targetSpeed);
 }
 
 // Gentle line-follow correction: both sides keep driving FORWARD, but the
@@ -276,6 +306,7 @@ void gridSteer(uint8_t baseSpeed, uint8_t boost, bool steerLeft) {
 
 void gridStop() {
     mecCar.Stop();
+    emitSpeedIfChanged(0);   // report the car is stationary to the dashboard
     Bridge.println(F("[SYSTEM] Robot Halted."));
 }
 
@@ -569,6 +600,19 @@ bool logColorRaw = false;
 
 int gridDetectColorValue() {
     if (!sensorsEnabled || emergencyStopActive) return ANY;
+    // Distance gate: the sensor only reads the block (not the floor) when it's
+    // close. Beyond COLOR_RELIABLE_DISTANCE_CM, return ANY instead of a bogus
+    // far reading (which tends to false-positive BLUE). distance <= 0 means the
+    // ultrasonic returned no echo — also untrusted.
+    int distance = gridGetDistanceCm();
+    if (distance <= 0 || distance > COLOR_RELIABLE_DISTANCE_CM) {
+        if (debugTelemetry || logColorRaw) {
+            Bridge.print(F("[DBG] Color skipped — distance "));
+            Bridge.print(distance);
+            Bridge.println(F("cm out of reliable range -> ANY"));
+        }
+        return ANY;
+    }
     unsigned long red = gridReadColorChannel(LOW, LOW);
     unsigned long green = gridReadColorChannel(HIGH, HIGH);
     unsigned long blue = gridReadColorChannel(LOW, HIGH);

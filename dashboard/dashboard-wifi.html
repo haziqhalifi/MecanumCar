@@ -530,6 +530,7 @@
       <h2>Current action</h2>
       <div class="state-val" id="actionVal">Idle</div>
       <span class="pill idle" id="actionPill">standby</span>
+      <div class="stat-row"><span class="k">speed</span><span class="v" id="speedVal">—</span></div>
       <div class="stat-row"><span class="k">last event</span><span class="v" id="lastEvent">—</span></div>
     </section>
 
@@ -912,6 +913,9 @@
       // The * key never prints "Key Pressed:" — the firmware short-circuits
       // straight to this message, so light its remote cell from here.
       if (!/dashboard/i.test(text)) flashRemoteCell(66);
+    } else if (/^\[SPEED\]/i.test(text)) {
+      const spm = text.match(/^\[SPEED\]\s*(\d+)/i);
+      if (spm) { cls = "tele"; updateSpeed(parseInt(spm[1], 10)); }
     } else if (/^\[TURN\]/i.test(text)) {
       cls = "turn"; turns++; $("turnCount").textContent = turns;
       const dir = /Left/i.test(text) ? "spin left 90°" : /Right/i.test(text) ? "spin right 90°" : "turning";
@@ -958,6 +962,12 @@
     $("distVal2").textContent = oob ? "--" : cm;
     $("distFill2").style.width = pct + "%";
     markFresh("cellDist", "distAge");
+  }
+
+  // Live commanded PWM speed (0..255) from the firmware's [SPEED] lines, shown
+  // under the Current action card. 0 = the car has stopped.
+  function updateSpeed(pwm) {
+    $("speedVal").textContent = pwm === 0 ? "0 (stopped)" : String(pwm);
   }
 
   function updateColor(name) {
