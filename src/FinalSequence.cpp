@@ -149,12 +149,13 @@ const uint8_t SPEED_ROTATE = 60;
 // short if this is too small). Tune per surface/battery: raise if it still
 // under-rotates, lower if it overshoots.
 //
-// The LEFT turn used to stop short because it broke on the offset LEFT sensor,
-// which reaches the perpendicular line before the body has rotated a full 90.
-// It now stops on the CENTER sensor (on the rotation axis), which crosses the
-// line at a true ~90, so LEFT no longer needs an inflated blind time. The blind
-// window only has to carry the center sensor OFF the starting junction black
-// onto white before hunting begins.
+// Both turns stop on their LEADING-edge sensor (RIGHT for a CW spin, LEFT for a
+// CCW spin) so they trigger at ~90 symmetrically. Stopping the LEFT turn on the
+// on-axis CENTER sensor instead let the body swing past 90 before the line
+// reached it, so LEFT over-rotated. The blind window only has to carry the
+// leading sensor OFF the starting junction black onto white before hunting
+// begins; raise it if the turn stops short on the junction, lower if it
+// overshoots.
 const unsigned long TURN_BLIND_LEFT_MS  = 350;
 const unsigned long TURN_BLIND_RIGHT_MS = 350;
 const unsigned long BRAKE_MS = 55;
@@ -173,6 +174,34 @@ const unsigned long STEP_TRANSITION_MS = 250;
 // the centre sensor on the line, so a sustained all-LOW only happens off-track.
 // Tune: raise if the car false-stops crossing wide gaps, lower to halt sooner.
 const unsigned long LINE_LOST_TIMEOUT_MS = 800;
+
+// ── Time-based coordinate projection (dead-reckoning recovery) ──────────────
+// When the line sensors miss the line (a faded/broken grid line, a gap the car
+// drifts across), instead of immediately e-stopping we ESTIMATE where the car is
+// from how long it has been driving since the last known junction, then actively
+// hunt the line back so the mission can continue.
+//
+// MS_PER_COORD is how long (ms) the car takes to travel ONE grid coordinate at
+// the normal follow speed (SPEED_START_FAST). This is a PLACEHOLDER — CALIBRATE
+// IT ON THE REAL CAR: send "FWD:1" (or STEP) on a clean line and time with a
+// stopwatch how long the car takes to cross one coordinate, then set this to that
+// value in ms. It is used only to PROJECT an estimated coordinate for reporting
+// and to decide when the car has likely crept a full node past the last junction
+// while off the line; the actual junction count still comes from the sensors
+// whenever they DO see the line, so a slightly-off value only affects the
+// reported estimate, never the real tracked count once the line is re-acquired.
+const unsigned long MS_PER_COORD = 1200;
+// While the line is lost, run the recovery hunt for at most this long before
+// giving up and latching the safety e-stop. Long enough to sweep both ways and
+// reverse a little; short enough that a truly off-grid car still halts promptly.
+const unsigned long LINE_RECOVER_TIMEOUT_MS = 2500;
+// Speed used for the recovery creep/sweep — a gentle crawl so the car doesn't
+// fling itself further off the grid while hunting for the line.
+const uint8_t LINE_RECOVER_SPEED = 40;
+// One recovery sweep leg duration: the car arcs one way for this long looking for
+// any line sensor to go HIGH, then arcs back the other way. Kept short so it
+// probes a small arc at a time instead of spinning away from the line.
+const unsigned long LINE_RECOVER_SWEEP_MS = 350;
 // Start speed for the scripted-path block approach. Kept below SPEED_MIN so the
 // approach creeps in noticeably slower and still tapers toward APPROACH_SPEED_FLOOR.
 // Lowered from 42: at the higher speed the car noses onto the block before its
@@ -181,14 +210,26 @@ const unsigned long LINE_LOST_TIMEOUT_MS = 800;
 // Must stay strictly below SPEED_MIN (38) so executeApproachMovement's taper
 // engages (it only ramps toward APPROACH_SPEED_FLOOR when startSpeed < SPEED_MIN;
 // at exactly SPEED_MIN the floor becomes SPEED_MIN and the approach runs flat).
-// Lowered further from 37 to 35 (one notch above APPROACH_SPEED_FLOOR=34) so the
-// WHOLE approach — not just the final taper — is a slow crawl, giving the
+// Lowered further from 37 to 35, then to 29 (one notch above APPROACH_SPEED_FLOOR=28)
+// so the WHOLE approach — not just the final taper — is a slow crawl, giving the
 // line-follow correction the maximum distance to straighten the car onto the line
-// before it reaches the block and grabs. Do NOT go below ~34: that is near the
-// motors' stall/breakaway floor (see APPROACH_SPEED_FLOOR note) and the car would
-// buzz in place and stop short of the block instead of creeping onto it.
+// before it reaches the block and grabs. MUST stay ABOVE APPROACH_SPEED_FLOOR: the
+// taper ramps DOWN from this value to the floor as the block nears, so if this
+// drops below the floor the ramp inverts and the car SPEEDS UP on final approach.
+// Tried as low as 22/20 on the car — NOT ENOUGH POWER: the motors couldn't
+// overcome breakaway torque, so the car buzzed/stalled instead of creeping. Raised
+// back to 35 (one notch above APPROACH_SPEED_FLOOR=34), the documented reliable
+// crawl. To still get a SLOW, well-aligned final approach without dropping PWM
+// below stall, the taper is started EARLIER instead (ITEM_DETECT_DISTANCE_CM=40) so
+// the car decelerates over more distance. Do NOT drop this toward the low 20s again
+// — that's below the motors' breakaway torque and the car won't move.
 const uint8_t PATH_APPROACH_SPEED = 35;
-const int ITEM_DETECT_DISTANCE_CM = 25;
+// Distance at which the approach STARTS tapering toward APPROACH_SPEED_FLOOR. Raised
+// from 25 to 40 so the slow-down begins farther from the block — a longer, earlier
+// glide to straighten onto the line and settle before gripping, WITHOUT needing a
+// below-stall PWM. The ultrasonic reads well past 40cm; beyond it the car just holds
+// PATH_APPROACH_SPEED until the block comes into range, then the taper takes over.
+const int ITEM_DETECT_DISTANCE_CM = 40;
 // Stop this far from the block to read colour and grab — leave a GAP rather than
 // nosing right up to it. The gripper jaws swing FORWARD as they close, so they
 // reach the block from this standoff; stopping closer makes the chassis collide
@@ -196,10 +237,13 @@ const int ITEM_DETECT_DISTANCE_CM = 25;
 // Empirical — tune on the real car: too large and the closing claw misses the
 // block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm.
 // Calibrated on the car: ~7cm gives a reliable colour read; 6cm COLLIDES with the
-// block. Stop at 8cm so ultrasonic jitter + the final creep still leave the car
-// safely short of the 6cm collision point while sitting close enough (~7-8cm) for
-// an accurate colour read and grip. Do NOT lower toward 6.
-const int GRAB_APPROACH_DISTANCE_CM = 8;
+// block. Was 8cm, but at that standoff the closing jaws DON'T REACH the block —
+// they swing forward but stop short. Lowered to 7cm so the gripper can actually
+// close on the block while staying above the 6cm chassis-collision point. This is
+// the tight window between under-reach (>=8) and collision (<=6); if the chassis
+// now bumps the block, raise back toward 8 — if the jaws still miss, the reach
+// itself is short and CLAW_CLOSED_ANGLE / the jaw linkage needs adjusting, not this.
+const int GRAB_APPROACH_DISTANCE_CM = 7;
 // Colour is only TRUSTED for the grab/search DECISION when the block is this close
 // (the ~7cm calibrated read distance, plus margin). The raw sensor still reads at
 // any distance for the live bench, but grabColorIfMatch ignores far reads — beyond
@@ -217,11 +261,13 @@ const int COLOR_DECISION_DISTANCE_CM = 10;
 // this earlier caused it to stop short of the block. Keep this close to
 // SPEED_MIN so it still physically moves; it only needs to be slightly below
 // SPEED_MIN to give a *visible* taper, not a true crawl.
-// Lowered from 38 to 34 so the very last stretch onto the block is a genuine
-// crawl — this is where the car needs to be dead-straight for the claw to grip.
-// 34 is close to the stall floor (~35 crawl elsewhere) so it still creeps but is
-// slow enough that any residual line-follow correction can straighten it before
-// it reaches the grab distance and stops.
+// Lowered from 38 to 34, then to 20 so the very last stretch onto the block is a
+// genuine crawl — this is where the car needs to be dead-straight for the claw to
+// grip, and a slower final creep gives it the most time to square onto the line
+// and stop smoothly. Confirmed on the car: values in the low 20s DON'T MOVE — the
+// motors can't overcome breakaway torque and just buzz/stall. 34 is the lowest that
+// still creeps reliably, so the floor is held there. For a slower FEEL, start the
+// taper earlier (ITEM_DETECT_DISTANCE_CM) rather than dropping this below 34.
 const uint8_t APPROACH_SPEED_FLOOR = 34;
 // Max PWM change per approach tick (~60ms). The approach speed is derived from
 // the raw ultrasonic distance, which jitters a few cm between pings, so the
@@ -456,6 +502,11 @@ bool checkEmergencyStop() {
 // caller's per-move timer: pass a local initialised to 0; it's stamped when the
 // line is first lost and cleared whenever any sensor sees a line again.
 // Call once per iteration of a forward-motion loop and return early if it's true.
+//
+// SUPERSEDED in the forward-motion loops by recoverOrStop(), which first tries to
+// dead-reckon the coordinate from travel time and hunt the line back before
+// falling back to this same e-stop. Kept as the plain "stop immediately" helper
+// for any caller that wants the old behaviour without the recovery attempt.
 bool checkOffGridStop(unsigned long &lostSince) {
     bool allLow = digitalRead(LINE_LEFT_PIN) == LOW &&
                   digitalRead(LINE_CENTER_PIN) == LOW &&
@@ -469,6 +520,117 @@ bool checkOffGridStop(unsigned long &lostSince) {
     return true;
 }
 
+// True if ANY line sensor currently sees the line — used as the recovery
+// re-acquire test (re-centering afterwards is the normal follower's job).
+static bool anyLineSensorHigh() {
+    return digitalRead(LINE_LEFT_PIN) == HIGH ||
+           digitalRead(LINE_CENTER_PIN) == HIGH ||
+           digitalRead(LINE_RIGHT_PIN) == HIGH;
+}
+
+// Time-based coordinate projection while the line is lost. Given how long the
+// car has been travelling forward since the last confirmed junction
+// (millis() - segmentStartMs), estimate how many WHOLE coordinates it has
+// covered (elapsed / MS_PER_COORD) and advance the tracked (currentX,currentY)
+// along the current heading by that many nodes — but never past a coordinate the
+// sensors have already counted, and clamped to the grid. This keeps the dashboard
+// map roughly right even across a stretch of missing line, WITHOUT the sensors:
+// pure dead-reckoning. `alreadyCounted` is how many junctions this move's own
+// loop has already tallied from the sensors, so we only project BEYOND those.
+// Returns the number of extra nodes projected (0 if less than one coord elapsed).
+static int projectCoordFromTime(unsigned long segmentStartMs) {
+    unsigned long elapsed = millis() - segmentStartMs;
+    int projected = (int)(elapsed / MS_PER_COORD);
+    if (projected <= 0) return 0;
+    for (int i = 0; i < projected; i++) {
+        int nx = currentX, ny = currentY;
+        switch (currentHeading) {
+            case EAST:  nx += 1; break;
+            case WEST:  nx -= 1; break;
+            case NORTH: ny += 1; break;
+            case SOUTH: ny -= 1; break;
+        }
+        // Stop projecting at the grid boundary — the car can't legitimately be
+        // past the outer line, so don't march the estimate off the map.
+        if (nx < GRID_MIN_X || nx > GRID_MAX_X || ny < GRID_MIN_Y || ny > GRID_MAX_Y) {
+            projected = i;
+            break;
+        }
+        currentX = nx; currentY = ny;
+    }
+    if (projected > 0) {
+        Bridge.print(F("[RECOVER] Line lost — projected "));
+        Bridge.print(projected);
+        Bridge.print(F(" coord(s) from time onto estimated ("));
+        Bridge.print(currentX); Bridge.print(F(",")); Bridge.print(currentY);
+        Bridge.println(F(")."));
+        reportPosition();
+    }
+    return projected;
+}
+
+// Line-loss handler with dead-reckoning recovery. Drop-in replacement for
+// checkOffGridStop in a forward-motion loop: call once per iteration.
+//   - While at least one sensor sees the line, does nothing (returns false) and
+//     resets the lost-timer.
+//   - Once the line has been gone for LINE_LOST_TIMEOUT_MS, instead of e-stopping
+//     it (a) projects the estimated coordinate from travel time and (b) actively
+//     hunts the line back: creep forward, then sweep left, then sweep right, then
+//     reverse a little — repeating until a sensor re-acquires the line or
+//     LINE_RECOVER_TIMEOUT_MS elapses. On re-acquire it returns false so the
+//     caller's normal follower resumes. Only if recovery fails does it latch the
+//     safety e-stop and return true.
+// `lostSince` is the caller's per-move lost-timer (local, init 0). `segmentStartMs`
+// is when the car left its last confirmed junction (the caller stamps it each time
+// it counts a junction), used for the time->coordinate projection. `projectCoord`
+// controls whether the projection advances the global (currentX,currentY): pass
+// true ONLY from loops that OWN the coordinate for this step (gridMoveForwardOneCoord,
+// goToDrop). Loops whose CALLER bumps the coordinate after the whole move (the
+// block-counting gridMoveForwardBlocks) pass false, so recovery still hunts the
+// line but doesn't double-count against the caller's own coordinate update.
+bool recoverOrStop(unsigned long &lostSince, unsigned long segmentStartMs, bool projectCoord) {
+    if (anyLineSensorHigh()) { lostSince = 0; return false; }
+    if (lostSince == 0) { lostSince = millis(); return false; }
+    if (millis() - lostSince < LINE_LOST_TIMEOUT_MS) return false;
+
+    // Line confirmed lost. Project the estimated coordinate from elapsed time so
+    // the tracker/dashboard know roughly where the car is, then try to recover.
+    if (projectCoord) projectCoordFromTime(segmentStartMs);
+
+    Bridge.println(F("[RECOVER] Hunting for the line to resume..."));
+    unsigned long recoverStart = millis();
+    // Sweep pattern cycles: 0 = creep straight, 1 = arc left, 2 = arc right,
+    // 3 = reverse. Each leg runs up to LINE_RECOVER_SWEEP_MS but bails the instant
+    // a sensor sees the line, so re-acquire is immediate.
+    int leg = 0;
+    while (millis() - recoverStart < LINE_RECOVER_TIMEOUT_MS) {
+        if (checkEmergencyStop()) return true;   // honour a real STOP mid-recovery
+        switch (leg % 4) {
+            case 0: gridSetSpeed(LINE_RECOVER_SPEED); mecCar.Advance(); break;
+            case 1: gridSteer(LINE_RECOVER_SPEED, TURN_CORRECTION_BOOST, true);  break;
+            case 2: gridSteer(LINE_RECOVER_SPEED, TURN_CORRECTION_BOOST, false); break;
+            case 3: gridSetSpeed(LINE_RECOVER_SPEED); mecCar.Back(); break;
+        }
+        unsigned long legStart = millis();
+        while (millis() - legStart < LINE_RECOVER_SWEEP_MS) {
+            if (checkEmergencyStop()) return true;
+            if (anyLineSensorHigh()) {
+                gridStop();
+                Bridge.println(F("[RECOVER] Line re-acquired — resuming follow."));
+                lostSince = 0;
+                return false;   // caller's follower takes over from here
+            }
+        }
+        leg++;
+    }
+
+    // Recovery exhausted — the car really is off the grid. Latch the safety stop.
+    emergencyStopActive = true;
+    gridStop();
+    Bridge.println(F("\n!!! SAFETY STOP: line lost and recovery failed — car off the grid !!!"));
+    return true;
+}
+
 bool gridRotateLeft90() {
     if (checkEmergencyStop()) return false;
     Bridge.println(F("\n[TURN] Symmetrical Spin 90 Degrees Left..."));
@@ -479,11 +641,15 @@ bool gridRotateLeft90() {
     while (millis() - startTime < TURN_BLIND_LEFT_MS) {
         if (checkEmergencyStop()) return false;
     }
-    // Stop on the CENTER sensor, not the offset LEFT sensor: center is on the
-    // rotation axis so it reaches the new perpendicular line at a true ~90.
+    // Stop on the LEFT sensor — the leading edge during a CCW spin — mirroring
+    // the RIGHT turn, which stops on its leading RIGHT sensor. Stopping on the
+    // on-axis CENTER sensor let the body swing PAST 90 before the line reached
+    // it, so the left turn over-rotated; the leading-edge sensor triggers at
+    // ~90 like the right turn. The blind window below must carry the LEFT sensor
+    // OFF the starting junction black first so it hunts the NEW line, not the old.
     while (true) {
         if (checkEmergencyStop()) return false;
-        if (digitalRead(LINE_CENTER_PIN) == HIGH) break;
+        if (digitalRead(LINE_LEFT_PIN) == HIGH) break;
     }
     spinRightInPlace(SPEED_ROTATE + 10);
     
@@ -528,10 +694,17 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
     bool onJunction = true;
     unsigned long telemetryTickMillis = millis();
     unsigned long lineLostSince = 0;
+    // Stamp when the car last left a confirmed junction, for the time-based
+    // coordinate projection in recoverOrStop.
+    unsigned long segmentStartMillis = millis();
 
     while (junctionCount < targetBlocks) {
         if (checkEmergencyStop()) return;
-        if (checkOffGridStop(lineLostSince)) return;
+        // Line-loss recovery: hunt the line back instead of e-stopping. This
+        // function doesn't own currentX/currentY (moveCoord/runPath bump them
+        // after the whole call), so don't project onto the globals here — pass
+        // false; recovery still reverses/sweeps the car back onto the line.
+        if (recoverOrStop(lineLostSince, segmentStartMillis, false)) return;
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
@@ -548,6 +721,7 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
             if (!onJunction) {
                 junctionCount++;
                 onJunction = true;
+                segmentStartMillis = millis();   // left a confirmed junction — restart the segment timer
                 if (junctionCount == targetBlocks) break;
             }
             gridSetSpeed(currentSpeed);
@@ -582,6 +756,10 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
     if (checkEmergencyStop()) return;
     unsigned long telemetryTickMillis = millis();
     unsigned long lineLostSince = 0;
+    // Segment timer for recovery: this whole move IS one coordinate, so it starts
+    // when the move starts. moveCoord() bumps the global coordinate after this call
+    // returns, so recovery here must NOT project onto the globals (would double-count).
+    unsigned long segmentStartMillis = millis();
     unsigned long leaveTime = millis();
     while (millis() - leaveTime < 140) {
         if (checkEmergencyStop()) return;
@@ -598,7 +776,7 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
 
     while (true) {
         if (checkEmergencyStop()) return;
-        if (checkOffGridStop(lineLostSince)) return;
+        if (recoverOrStop(lineLostSince, segmentStartMillis, false)) return;
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
@@ -846,11 +1024,19 @@ void openClawWithAttach() {
 // toward open or closed from wherever it currently sits, instead of jumping
 // straight to the open/closed extreme.
 const uint8_t CLAW_NUDGE_STEP = 8;
+// Nudge exploration limits — DELIBERATELY the servo's full physical travel
+// (0..180), NOT the CLAW_OPEN_ANGLE..CLAW_CLOSED_ANGLE grip range. This lets the
+// LEFT/RIGHT buttons sweep the whole servo so you can physically find the true
+// widest-open angle, then set CLAW_OPEN_ANGLE to whatever the [GRIPPER] Nudged-to
+// readout shows at max open. Once that angle is known, this range can be tightened
+// back to the grip limits to stop the nudge from over-driving the linkage.
+const uint8_t CLAW_NUDGE_MIN = 0;
+const uint8_t CLAW_NUDGE_MAX = 180;
 void clawNudge(bool towardClosed) {
     if (emergencyStopActive) return;
     int target = towardClosed ? clawCurrentAngle + CLAW_NUDGE_STEP
                                : clawCurrentAngle - CLAW_NUDGE_STEP;
-    target = constrain(target, CLAW_OPEN_ANGLE, CLAW_CLOSED_ANGLE);
+    target = constrain(target, CLAW_NUDGE_MIN, CLAW_NUDGE_MAX);
     clawServo.attach(CLAW_SERVO_PIN);
     clawServo.write(target);
     delay(200);
@@ -877,10 +1063,14 @@ void closeClawGrip() {
 
     clawServo.attach(CLAW_SERVO_PIN);
 
-    // SLOW SWEEP: Gradually close the claw instead of snapping it
-    for (int angle = CLAW_OPEN_ANGLE; angle <= CLAW_CLOSED_ANGLE; angle += 2) {
+    // SLOW SWEEP: Gradually close the claw instead of snapping it.
+    // 1-degree steps with a 25ms dwell each — ~3x slower and smoother than the
+    // old 2-degree/15ms sweep so the jaws ease onto the block instead of
+    // snapping shut and knocking it out of alignment. Raise the delay further
+    // (30/35) to slow it more; shrink it toward 15 to speed the close back up.
+    for (int angle = CLAW_OPEN_ANGLE; angle <= CLAW_CLOSED_ANGLE; angle += 1) {
         clawServo.write(angle);
-        delay(15); // Increase to 20 or 25 if it's STILL too fast
+        delay(25);
     }
 
     delay(800); // Wait almost a full second to ensure a firm grip before moving
@@ -1142,10 +1332,18 @@ void goToDrop() {
     if (checkEmergencyStop()) return;
     bool activeJunctionFlag = true;   // debounce: only count a junction on its leading edge
     unsigned long lineLostSince = 0;
+    // Segment timer for recovery's time-based projection. NOTE: this run crawls at
+    // PATH_APPROACH_SPEED, slower than the SPEED_START_FAST that MS_PER_COORD is
+    // calibrated at, so the time->coordinate estimate here is rough — it only kicks
+    // in on a lost line as a best-effort fallback, and the projection is clamped at
+    // the X=9 drop boundary so it can never march past the drop node.
+    unsigned long segmentStartMillis = millis();
 
     while (currentX < DROP_TARGET_X) {
         if (checkEmergencyStop()) return;
-        if (checkOffGridStop(lineLostSince)) return;
+        // goToDrop OWNS currentX (it bumps it on each junction below), so recovery
+        // here projects the estimate onto the global coordinate — pass true.
+        if (recoverOrStop(lineLostSince, segmentStartMillis, true)) return;
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
@@ -1160,6 +1358,7 @@ void goToDrop() {
             if (!activeJunctionFlag) {
                 activeJunctionFlag = true;
                 currentX += 1;
+                segmentStartMillis = millis();   // fresh junction — restart the projection timer
                 reportPosition();
                 if (currentX >= DROP_TARGET_X) break;   // reached (9,3)
             }
@@ -1385,16 +1584,18 @@ int searchAndGrab(int targetColour, int startRow) {
         Bridge.println(row);
 
         // Route to the block via the X=4 corridor, then approach only as far as
-        // column 2 (one node EAST of the block at column 1). moveCoord does its
+        // column 3 (TWO nodes EAST of the block at column 1). moveCoord does its
         // X move before its Y move, so going to (4,row) first pulls the car out
         // to column 4 before it changes rows — every reorientation turn happens
         // at column 4, well clear of the block column, and inter-block travel
-        // stays on that corridor. The car then stops at column 2 and lets
-        // moveToGrab creep the last bit with the ultrasonic, so it never drives
-        // onto column 1 and clashes with the block.
+        // stays on that corridor. The car then stops at column 3 and lets
+        // moveToGrab creep the last bit with the ultrasonic — starting the slow,
+        // line-corrected approach ONE BLOCK EARLIER (col 3 instead of col 2) so it
+        // has a full extra grid cell to straighten and slow before the block. It
+        // still never drives onto column 1 and clashes with the block.
         moveCoord(4, row);
         if (emergencyStopActive) return -1;
-        moveCoord(2, row);
+        moveCoord(3, row);
         if (emergencyStopActive) return -1;
         turnToHeading(WEST);
 
@@ -1410,8 +1611,16 @@ int searchAndGrab(int targetColour, int startRow) {
 
         // Wrong colour: back off and (if any remain) hop to the next block.
         Bridge.println(F("[SEARCH] Wrong colour — reversing to try next block."));
-        backOffBlock();                 // reverse to the (2,row) junction, still facing WEST
+        backOffBlock();                 // reverse to the col-2 junction, still facing WEST
         if (emergencyStopActive) return -1;
+        // Resync the tracker to where the car PHYSICALLY is after the back-off.
+        // The approach now starts at column 3, but backOffBlock always reverses to
+        // the first junction east of the block (column 2, since the block sits at
+        // column 1) — so currentX would otherwise read 3 (the last moveCoord node)
+        // while the car sits at 2. Pin it to 2 so the two-node re-hop below (2->4)
+        // stays correct regardless of where the approach started.
+        currentX = 2;
+        reportPosition();
 
         // If another block remains, pull EAST back onto the X=4 corridor WHILE
         // STILL FACING WEST (reverse, no turn). Without this the car sits at
@@ -1449,6 +1658,10 @@ static void carryHomeViaRow3() {
 
     backOffBlock();                 // reverse to (2, grabbedRow) junction, facing WEST
     if (emergencyStopActive) return;
+    // The grab approach starts at column 3 now, but backOffBlock reverses to the
+    // first junction east of the block — column 2 (block sits at column 1). Pin
+    // the tracker to 2 so the reverseOneCoordEast below lands currentX at 3.
+    currentX = 2;
     reverseOneCoordEast();          // reverse to (3, grabbedRow), still facing WEST
     if (emergencyStopActive) return;
 
@@ -1598,7 +1811,11 @@ void runPath(const Step* path, int len, int targetColour) {
 void executeAutoMission(int targetY, int color) {
     sensorsEnabled = true;
     gridMoveForwardBlocks(2, SPEED_START_FAST);
-    moveCoord(2, targetY);
+    // Stop at column 3 (two nodes east of the block at column 1) so the ultrasonic
+    // creep starts ONE BLOCK EARLIER — an extra grid cell to straighten and slow
+    // before the block. moveHome() below re-anchors currentX absolutely, so the
+    // creep leaving currentX at 3 doesn't desync the tracker.
+    moveCoord(3, targetY);
     if (emergencyStopActive) return;
     delay(300);
     moveToGrab(color);
