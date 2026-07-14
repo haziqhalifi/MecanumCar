@@ -139,10 +139,10 @@
   .sensors { display: flex; justify-content: space-around; gap: .6rem; }
   .sensor { display: flex; flex-direction: column; align-items: center; gap: .5rem; }
   .lamp {
-    width: 54px; height: 54px; border-radius: 12px;
+    width: 40px; height: 40px; border-radius: 9px;
     background: var(--panel-2); border: 1px solid var(--edge-hi);
     display: grid; place-items: center;
-    font-family: var(--mono); font-size: .78rem; color: var(--ink-faint);
+    font-family: var(--mono); font-size: .7rem; color: var(--ink-faint);
     transition: background .1s, box-shadow .1s, color .1s, border-color .1s;
   }
   .lamp.lit {
@@ -367,12 +367,12 @@
 <main>
   <div class="estop" id="estopBanner">
     <span class="ico">■</span>
-    <span>EMERGENCY STOP ACTIVE — motors halted. Press Re-arm (or a path button on the remote) to resume.</span>
+    <span>EMERGENCY STOP — motors halted. Send any command (or press a remote button) to resume.</span>
   </div>
 
   <div class="grid">
-    <!-- Control panel -->
-    <section class="card col-12" id="controlCard">
+    <!-- Control panel (ordered below the live-monitoring rows) -->
+    <section class="card col-12" id="controlCard" style="order:3">
       <h2>Manual control · step debug</h2>
       <div class="ctl-note" id="ctlHint">Connecting to the robot over WiFi… each button sends one command and runs the same routine the IR remote would.</div>
 
@@ -422,7 +422,6 @@
             <button class="ctl" id="liveBtn" disabled title="Stream ultrasonic + color every 250ms for sensor testing">◉ Live readings: OFF</button>
           </div>
           <div class="ctl-row">
-            <button class="ctl arm" data-cmd="RESUME" disabled title="Clear e-stop latch">✔ Re-arm</button>
             <button class="ctl" data-cmd="RESET" disabled title="Reset grid coordinates to home">⌂ Reset coords</button>
           </div>
         </div>
@@ -440,7 +439,7 @@
     </section>
 
     <!-- IR remote debug -->
-    <section class="card col-12" id="remoteCard">
+    <section class="card col-6" id="remoteCard">
       <div class="test-head">
         <h2>IR remote debug · 9 mission buttons</h2>
         <span class="live-tag" id="irLastTag">no press yet</span>
@@ -454,19 +453,19 @@
           <span class="gh">start row 5</span>
 
           <span class="gh rowlbl"><i class="cdot" style="background:#e35d6a"></i>RED</span>
-          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="22" data-run="SEARCH:1"  disabled><b>Search RED</b><small>start row 1 → grab → drop</small><span class="ir">IR 22</span></button>
-          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="25" data-run="SEARCH:3"  disabled><b>Search RED</b><small>start row 3 → grab → drop</small><span class="ir">IR 25</span></button>
-          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="13" data-run="SEARCH:5"  disabled><b>Search RED</b><small>start row 5 → grab → drop</small><span class="ir">IR 13</span></button>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="22" data-run="SEARCH:1"  disabled><b>Search RED</b><span class="ir">IR 22</span></button>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="25" data-run="SEARCH:3"  disabled><b>Search RED</b><span class="ir">IR 25</span></button>
+          <button class="rbtn" style="--accent-c:#e35d6a" data-ir="13" data-run="SEARCH:5"  disabled><b>Search RED</b><span class="ir">IR 13</span></button>
 
           <span class="gh rowlbl"><i class="cdot" style="background:#4d8fe1"></i>BLUE</span>
-          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="12" data-run="SEARCH:11" disabled><b>Search BLUE</b><small>start row 1 → grab → drop</small><span class="ir">IR 12</span></button>
-          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="24" data-run="SEARCH:13" disabled><b>Search BLUE</b><small>start row 3 → grab → drop</small><span class="ir">IR 24</span></button>
-          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="94" data-run="SEARCH:15" disabled><b>Search BLUE</b><small>start row 5 → grab → drop</small><span class="ir">IR 94</span></button>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="12" data-run="SEARCH:11" disabled><b>Search BLUE</b><span class="ir">IR 12</span></button>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="24" data-run="SEARCH:13" disabled><b>Search BLUE</b><span class="ir">IR 24</span></button>
+          <button class="rbtn" style="--accent-c:#4d8fe1" data-ir="94" data-run="SEARCH:15" disabled><b>Search BLUE</b><span class="ir">IR 94</span></button>
 
           <span class="gh rowlbl"><i class="cdot" style="background:#e6c34d"></i>YELLOW</span>
-          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="8"  data-run="SEARCH:21" disabled><b>Search YELLOW</b><small>start row 1 → grab → drop</small><span class="ir">IR 8</span></button>
-          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="28" data-run="SEARCH:23" disabled><b>Search YELLOW</b><small>start row 3 → grab → drop</small><span class="ir">IR 28</span></button>
-          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="90" data-run="SEARCH:25" disabled><b>Search YELLOW</b><small>start row 5 → grab → drop</small><span class="ir">IR 90</span></button>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="8"  data-run="SEARCH:21" disabled><b>Search YELLOW</b><span class="ir">IR 8</span></button>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="28" data-run="SEARCH:23" disabled><b>Search YELLOW</b><span class="ir">IR 28</span></button>
+          <button class="rbtn" style="--accent-c:#e6c34d" data-ir="90" data-run="SEARCH:25" disabled><b>Search YELLOW</b><span class="ir">IR 90</span></button>
         </div>
 
         <div class="remote-aux">
@@ -481,12 +480,21 @@
       </div>
     </section>
 
-    <!-- Sensor test bench -->
-    <section class="card col-12" id="testCard">
+    <!-- Live map -->
+    <section class="card col-6">
+      <h2>Live map · tracked pose</h2>
+      <div class="map-wrap">
+        <svg id="mapSvg" viewBox="0 0 326 202" role="img" aria-label="grid map with robot position"></svg>
+      </div>
+      <div class="stat-row" style="border:0; padding:0;"><span class="k">pose (x, y · heading)</span><span class="v" id="poseVal">7, 3 · WEST</span></div>
+      <div class="ctl-note">6×6 collecting grid · 3×2 START zone (home 7,3) · drop area next to it. Red band = no-go perimeter (car stays one line in from every edge). Driven by firmware <b>[POS]</b> lines — updates on coordinate-tracked moves (SEARCH missions, Reset coords); scripted paths 1–3 don't report position</div>
+    </section>
+
+    <!-- Sensor test bench (single source for distance / color / IR) -->
+    <section class="card col-6" id="testCard">
       <div class="test-head">
         <h2>Sensor test bench</h2>
         <span class="live-tag" id="liveTag">idle</span>
-        <span class="ctl-note">turn on <b>Live readings</b> to stream ultrasonic + color · aim the remote to test IR</span>
       </div>
       <div class="test-grid">
         <!-- Ultrasonic -->
@@ -517,62 +525,27 @@
       </div>
     </section>
 
-    <!-- Live map -->
-    <section class="card col-6">
-      <h2>Live map · tracked pose</h2>
-      <div class="map-wrap">
-        <svg id="mapSvg" viewBox="0 0 326 202" role="img" aria-label="grid map with robot position"></svg>
-      </div>
-      <div class="stat-row" style="border:0; padding:0;"><span class="k">pose (x, y · heading)</span><span class="v" id="poseVal">7, 3 · WEST</span></div>
-      <div class="ctl-note">6×6 collecting grid · 2×3 START corridor · drop area next to it. Red band = no-go perimeter (car stays one line in from every edge). Driven by firmware <b>[POS]</b> lines — updates on coordinate-tracked moves (SEARCH missions, Reset coords); scripted paths 1–3 don't report position</div>
-    </section>
-
-    <!-- Line sensors -->
-    <section class="card col-6">
-      <h2>Line sensors</h2>
-      <div class="sensors">
-        <div class="sensor"><div class="lamp" id="sL">L</div><small>A0 · LEFT</small></div>
-        <div class="sensor"><div class="lamp" id="sC">C</div><small>A1 · CENTER</small></div>
-        <div class="sensor"><div class="lamp" id="sR">R</div><small>A2 · RIGHT</small></div>
-      </div>
-      <div class="junction-note" id="junctionNote">press <b>Line sensors</b> to snapshot L/C/R</div>
-    </section>
-
     <!-- Current action -->
-    <section class="card col-6">
+    <section class="card col-3">
       <h2>Current action</h2>
       <div class="state-val" id="actionVal">Idle</div>
       <span class="pill idle" id="actionPill">standby</span>
       <div class="stat-row"><span class="k">last event</span><span class="v" id="lastEvent">—</span></div>
     </section>
 
-    <!-- Distance -->
-    <section class="card col-4">
-      <h2>Ultrasonic range</h2>
-      <div class="readout"><span class="val" id="distVal">--</span><span class="unit">cm</span></div>
-      <div class="dist-bar"><i id="distFill"></i></div>
-      <div class="dist-scale"><span>0</span><span>grab ≤6</span><span>detect ≤25</span><span>50+</span></div>
-    </section>
-
-    <!-- Color -->
-    <section class="card col-4">
-      <h2>Detected color</h2>
-      <div class="color-chip">
-        <div class="swatch" id="swatch"></div>
-        <span class="name" id="colorName">—</span>
+    <!-- Line sensors (minimized) -->
+    <section class="card col-3">
+      <h2>Line sensors</h2>
+      <div class="sensors">
+        <div class="sensor"><div class="lamp" id="sL">L</div><small>LEFT</small></div>
+        <div class="sensor"><div class="lamp" id="sC">C</div><small>CTR</small></div>
+        <div class="sensor"><div class="lamp" id="sR">R</div><small>RIGHT</small></div>
       </div>
-      <div class="stat-row"><span class="k">readings</span><span class="v" id="colorCount">0</span></div>
-    </section>
-
-    <!-- IR key -->
-    <section class="card col-4">
-      <h2>Last IR command</h2>
-      <div class="readout"><span class="key-badge" id="keyVal">—</span></div>
-      <div class="key-map" id="keyMap">no button pressed yet</div>
+      <div class="junction-note" id="junctionNote">press <b>Line sensors</b> to snapshot</div>
     </section>
 
     <!-- Session stats -->
-    <section class="card col-12">
+    <section class="card col-12" style="order:4">
       <h2>Session</h2>
       <div style="display:flex; gap:2rem; flex-wrap:wrap; font-family:var(--mono); font-size:.8rem;">
         <div class="stat-row" style="flex:1; min-width:130px; border:0; padding:0;"><span class="k">connected</span><span class="v" id="upTime">00:00</span></div>
@@ -583,7 +556,7 @@
     </section>
 
     <!-- Console -->
-    <section class="card col-12 console-card">
+    <section class="card col-12 console-card" style="order:4">
       <div class="console-head">
         <h2>Robot console</h2>
         <label class="toggle"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
@@ -690,6 +663,9 @@
     try {
       ws.send(cmd);
       logLine("→ " + cmd, "sent");
+      // Any command other than STOP resumes the robot (no re-arm needed), so
+      // clear the emergency-stop banner as soon as one is sent.
+      if (!/^STOP/i.test(cmd)) setEstop(false);
     } catch (e) {
       logLine("[dashboard] send failed: " + e.message, "crit");
     }
@@ -927,7 +903,9 @@
       const mm = text.match(/distance:\s*(-{2,3}|\d+)cm\s*\|\s*color:\s*(.+)$/i);
       if (mm) { cls = "tele"; updateDistance(mm[1]); updateColor(mm[2].trim()); }
     } else if (/^Key Pressed:/i.test(text)) {
-      cls = "key"; updateKey(parseInt(text.replace(/[^0-9-]/g, ""), 10));
+      // The estop (*) key never prints "Key Pressed:", so any key that does is
+      // a resuming press — clear the banner.
+      cls = "key"; setEstop(false); updateKey(parseInt(text.replace(/[^0-9-]/g, ""), 10));
     } else if (/EMERGENCY STOP/i.test(text)) {
       cls = "crit"; setEstop(true); estops++; $("estopCount").textContent = estops;
       setAction("E-STOP", "idle", "emergency stop triggered");
@@ -977,10 +955,8 @@
     const oob = /-/.test(token);
     const cm = oob ? null : parseInt(token, 10);
     const pct = oob ? 0 : Math.max(2, Math.min(100, (cm / 50) * 100));
-    [["distVal", "distFill"], ["distVal2", "distFill2"]].forEach(([v, f]) => {
-      $(v).textContent = oob ? "--" : cm;
-      $(f).style.width = pct + "%";
-    });
+    $("distVal2").textContent = oob ? "--" : cm;
+    $("distFill2").style.width = pct + "%";
     markFresh("cellDist", "distAge");
   }
 
@@ -989,12 +965,9 @@
     const up = name.toUpperCase();
     const c = known.find((k) => up.startsWith(k)) || "";
     const label = c || "ANY / other";
-    $("swatch").setAttribute("data-c", c);
     $("swatch2").setAttribute("data-c", c);
-    $("colorName").textContent = label;
     $("colorName2").textContent = label;
     colorReads++;
-    $("colorCount").textContent = colorReads;
     $("colorCount2").textContent = colorReads;
     markFresh("cellColor", "colorAge");
   }
@@ -1015,9 +988,7 @@
   function updateKey(k) {
     if (Number.isNaN(k)) return;
     const meaning = KEYMAP[k] || "unmapped code";
-    $("keyVal").textContent = k;
     $("keyVal2").textContent = k;
-    $("keyMap").textContent = meaning;
     $("keyMap2").textContent = meaning;
     markFresh("cellIr", "irAge");
     flashRemoteCell(k);
