@@ -1,0 +1,306 @@
+<meta charset="utf-8">
+<title>Solar-Powered Farm Harvester · Live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --sky-top: #7fc5f0; --sky-bot: #dff1fb;
+    --field: #6fae4a; --field-dk: #4f8a34;
+    --soil: #b07a45;
+    --ink: #17313a; --ink-dim: #4a6472;
+    --card: #ffffff; --edge: #cfe0ea;
+    --sun: #ffd24a; --sun-glow: #ffb02e;
+    --accent: #0a8ea0; --good: #2f9e44; --warn: #e0872a; --crit: #d23f4d;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  /* Night palette when the harvester is asleep */
+  body.night {
+    --sky-top: #14243a; --sky-bot: #2b3f5c;
+    --field: #2f5a2e; --field-dk: #234522; --soil: #6b4a2c;
+    --ink: #e6eef5; --ink-dim: #9fb4c6;
+    --card: #16233a; --edge: #2b3f5c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: var(--sans); color: var(--ink);
+    background: linear-gradient(180deg, var(--sky-top), var(--sky-bot));
+    min-height: 100vh; transition: background .8s ease, color .5s ease;
+    -webkit-font-smoothing: antialiased;
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition-duration: .01s !important; } }
+
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 1.2rem 1.1rem 2.5rem; }
+
+  header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .logo { font-size: 2rem; line-height: 1; }
+  .titles { margin-right: auto; }
+  .titles .grp { font-family: var(--mono); font-size: .68rem; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); }
+  .titles h1 { margin: .05rem 0 0; font-size: 1.5rem; letter-spacing: .2px; }
+  .conn { display: flex; align-items: center; gap: .5rem; font-family: var(--mono); font-size: .74rem; color: var(--ink-dim);
+    background: color-mix(in srgb, var(--card) 70%, transparent); padding: .4rem .7rem; border-radius: 999px; border: 1px solid var(--edge); }
+  .conn .dot { width: 9px; height: 9px; border-radius: 50%; background: #9aa; }
+  .conn .dot.on { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 30%, transparent); animation: pulse 2s infinite; }
+  .conn .dot.err { background: var(--crit); }
+  @keyframes pulse { 50% { opacity: .4; } }
+
+  /* ── The scene ── */
+  .scene {
+    position: relative; height: 340px; border-radius: 20px; overflow: hidden;
+    border: 1px solid var(--edge);
+    background: linear-gradient(180deg, transparent 0%, transparent 58%, var(--field) 58%, var(--field-dk) 100%);
+    box-shadow: 0 12px 40px -18px rgba(0,0,0,.4);
+  }
+  .sky-body { position: absolute; inset: 0; }
+  /* Sun / moon */
+  .sun {
+    position: absolute; top: 34px; right: 60px; width: 74px; height: 74px; border-radius: 50%;
+    background: radial-gradient(circle at 40% 38%, #fff2b8, var(--sun) 60%, var(--sun-glow));
+    box-shadow: 0 0 50px 12px color-mix(in srgb, var(--sun) 55%, transparent);
+    transition: opacity .8s ease, transform .8s ease, box-shadow .8s ease; font-size: 0;
+  }
+  body.night .sun { background: radial-gradient(circle at 38% 38%, #f2f4ff, #cfd6ef 62%, #aab3d6); box-shadow: 0 0 26px 6px rgba(180,190,230,.4); }
+  body.eco .sun { opacity: .35; }
+  /* Cloud (eco / cloudy) */
+  .cloud {
+    position: absolute; top: 40px; right: 40px; font-size: 4.6rem; line-height: 1;
+    opacity: 0; transform: translateX(30px); transition: opacity .6s ease, transform .6s ease;
+    filter: drop-shadow(0 6px 10px rgba(0,0,0,.15)); pointer-events: none;
+  }
+  body.eco .cloud { opacity: 1; transform: translateX(0); }
+
+  /* Ground props */
+  .field-lbl, .barn-lbl {
+    position: absolute; bottom: 8px; font-family: var(--mono); font-size: .62rem; letter-spacing: .14em;
+    text-transform: uppercase; color: rgba(255,255,255,.85); font-weight: 700;
+  }
+  .field-lbl { left: 16px; } .barn-lbl { right: 16px; }
+  .crops { position: absolute; bottom: 40px; left: 10px; font-size: 2.1rem; letter-spacing: -6px; user-select: none; }
+  .barn { position: absolute; bottom: 44px; right: 26px; font-size: 3.4rem; line-height: 1; user-select: none; }
+  .arm {
+    position: absolute; bottom: 96px; right: 44px; font-size: 2.2rem; opacity: 0;
+    transform: translateY(-8px) rotate(0deg); transition: opacity .4s ease; transform-origin: top center;
+  }
+  body.extract .arm { opacity: 1; animation: lift 1.6s ease-in-out infinite; }
+  @keyframes lift { 0%,100% { transform: translateY(-8px) rotate(-6deg); } 50% { transform: translateY(4px) rotate(6deg); } }
+
+  /* The harvester */
+  .robot {
+    position: absolute; bottom: 46px; left: 82%; font-size: 3rem; line-height: 1;
+    transform: translateX(-50%) scaleX(-1); user-select: none;
+    transition: left 3.5s cubic-bezier(.45,.05,.35,1);
+    filter: drop-shadow(0 6px 8px rgba(0,0,0,.28));
+  }
+  body.fast .robot { transition-duration: 3.5s; }
+  body.slow .robot { transition-duration: 7s; }       /* eco: visibly slower */
+  .robot .zzz { position: absolute; top: -18px; right: -6px; font-size: 1rem; opacity: 0; transition: opacity .5s; }
+  body.night .robot .zzz { opacity: 1; }
+  .robot .puff { position: absolute; top: -10px; left: -14px; font-size: 1rem; opacity: 0; }
+  body.moving .robot .puff { opacity: .8; animation: puff 1.1s ease-out infinite; }
+  @keyframes puff { 0% { opacity: .7; transform: translate(0,0) scale(.8);} 100% { opacity: 0; transform: translate(-14px,-10px) scale(1.3);} }
+
+  /* ── FSM ribbon ── */
+  .fsm { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1.1rem 0 0; }
+  .fsm .st {
+    flex: 1; min-width: 130px; display: flex; align-items: center; gap: .5rem;
+    padding: .6rem .7rem; border-radius: 12px; background: var(--card); border: 1px solid var(--edge);
+    color: var(--ink-dim); font-weight: 600; font-size: .82rem; transition: all .3s ease;
+  }
+  .fsm .st .ico { font-size: 1.1rem; filter: grayscale(.6); opacity: .7; transition: all .3s; }
+  .fsm .st.active {
+    color: var(--ink); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--card));
+    box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--accent) 70%, transparent); transform: translateY(-2px);
+  }
+  .fsm .st.active .ico { filter: none; opacity: 1; transform: scale(1.15); }
+  .fsm .st.eco.active { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--card)); box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--warn) 70%, transparent); }
+
+  /* ── Now-playing narration ── */
+  .now {
+    margin-top: 1.1rem; padding: 1.1rem 1.3rem; border-radius: 16px; background: var(--card); border: 1px solid var(--edge);
+    display: flex; align-items: center; gap: 1rem;
+  }
+  .now .big { font-size: 1.9rem; }
+  .now .txt h2 { margin: 0; font-size: 1.15rem; }
+  .now .txt p { margin: .25rem 0 0; color: var(--ink-dim); font-size: .92rem; line-height: 1.4; }
+  .now .badge {
+    margin-left: auto; align-self: flex-start; font-family: var(--mono); font-size: .64rem; font-weight: 700;
+    letter-spacing: .1em; text-transform: uppercase; padding: .3rem .6rem; border-radius: 999px;
+    color: #fff; background: var(--accent); white-space: nowrap;
+  }
+  .now .badge.eco { background: var(--warn); }
+  .now .badge.sleep { background: #64748b; }
+
+  /* ── Demo controls ── */
+  .controls { margin-top: 1.1rem; display: flex; gap: .6rem; flex-wrap: wrap; }
+  .controls button {
+    font-family: var(--sans); font-size: .92rem; font-weight: 700; color: var(--ink);
+    background: var(--card); border: 1px solid var(--edge); border-radius: 12px;
+    padding: .7rem 1.1rem; cursor: pointer; transition: transform .05s, border-color .15s, background .15s; flex: 1; min-width: 140px;
+  }
+  .controls button:hover:not(:disabled) { border-color: var(--accent); }
+  .controls button:active:not(:disabled) { transform: translateY(1px); }
+  .controls button:disabled { opacity: .45; cursor: not-allowed; }
+  .controls button.go { background: var(--good); color: #fff; border-color: var(--good); }
+  .controls button.cloud.on { background: var(--warn); color: #fff; border-color: var(--warn); }
+  .controls button.stop { background: var(--crit); color: #fff; border-color: var(--crit); }
+
+  .ticker { margin-top: .8rem; font-family: var(--mono); font-size: .72rem; color: var(--ink-dim); min-height: 1.1em; text-align: center; }
+  .foot { margin-top: 1.2rem; text-align: center; font-family: var(--mono); font-size: .66rem; color: var(--ink-dim); }
+  .foot a { color: var(--accent); }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="logo">🌱</div>
+    <div class="titles">
+      <div class="grp">Group 8 · live prototype</div>
+      <h1>The Solar-Powered Farm Harvester</h1>
+    </div>
+    <div class="conn"><span class="dot" id="dot"></span><span id="connLabel">connecting…</span></div>
+  </header>
+
+  <div class="scene" id="scene">
+    <div class="sky-body">
+      <div class="sun"></div>
+      <div class="cloud">☁️</div>
+    </div>
+    <span class="crops">🌾🌾🌾</span>
+    <span class="field-lbl">Field</span>
+    <span class="barn">🛖</span>
+    <span class="arm">🦾</span>
+    <span class="barn-lbl">Barn</span>
+    <div class="robot" id="robot">🚜<span class="zzz">💤</span><span class="puff">💨</span></div>
+  </div>
+
+  <div class="fsm" id="fsm">
+    <div class="st" data-fsm="sleep"><span class="ico">🌙</span>Sleep Mode</div>
+    <div class="st" data-fsm="field"><span class="ico">🌅</span>Moving to Field</div>
+    <div class="st" data-fsm="load"><span class="ico">📦</span>Loading</div>
+    <div class="st" data-fsm="barn"><span class="ico">🚚</span>Moving to Barn</div>
+    <div class="st eco" data-fsm="eco"><span class="ico">☁️</span>Eco-Mode</div>
+    <div class="st" data-fsm="wait"><span class="ico">🦾</span>Waiting for Extraction</div>
+  </div>
+
+  <div class="now">
+    <span class="big" id="nowIco">🌙</span>
+    <div class="txt">
+      <h2 id="nowTitle">Sleep Mode</h2>
+      <p id="nowDesc">Conserving battery. Waiting for the light sensor to detect sunrise.</p>
+    </div>
+    <span class="badge sleep" id="nowBadge">standby</span>
+  </div>
+
+  <div class="controls">
+    <button class="go"    id="btnStart" disabled>▶ Start harvest</button>
+    <button class="cloud" id="btnCloud" disabled>☁ Cloud passes (Eco-Mode)</button>
+    <button class="stop"  id="btnStop"  disabled>■ Stop</button>
+    <button            id="btnReset" disabled>⌂ Reset</button>
+  </div>
+
+  <div class="ticker" id="ticker">Waiting for the harvester…</div>
+  <p class="foot">Live over WiFi · driven by the same robot as the <a href="/">engineering dashboard</a>. This view narrates the finite-state machine for demo day.</p>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const body = document.body;
+
+  // ── State descriptions (Group 8 FSM) ──
+  const STATES = {
+    sleep: { ico: "🌙", title: "Sleep Mode",             badge: "standby",  cls: "sleep",
+      desc: "Conserving battery. Waiting for the light sensor to detect sunrise." },
+    field: { ico: "🌅", title: "Moving to Field",        badge: "driving",  cls: "",
+      desc: "Sunrise detected — the harvester wakes and drives out to the field." },
+    load:  { ico: "📦", title: "Loading",                badge: "waiting",  cls: "",
+      desc: "At the field, waiting in the Loading state until the farmer fills its bin. When the weight sensor trips, it heads for the barn." },
+    barn:  { ico: "🚚", title: "Moving to Barn",         badge: "driving",  cls: "",
+      desc: "Bin full — carrying the freshly picked fruit back toward the barn." },
+    eco:   { ico: "☁️", title: "Eco-Mode",               badge: "eco",      cls: "eco",
+      desc: "A cloud dropped the solar input. Running in Eco-Mode: moving slower and turning off non-essential sensors to save power." },
+    wait:  { ico: "🦾", title: "Waiting for Extraction", badge: "at barn",  cls: "",
+      desc: "At the barn. Signaling the heavy-duty gantry arm to lift the fruit out of the bin without bruising it." },
+  };
+  // Where the harvester sits in the scene for each state (% from left).
+  const POS = { sleep: 82, field: 8, load: 8, barn: 82, eco: 48, wait: 82 };
+
+  let fsmState = null;
+  function apply(key) {
+    if (!key || key === fsmState) return;
+    const prev = fsmState; fsmState = key;
+    const s = STATES[key];
+
+    document.querySelectorAll(".fsm .st").forEach((el) => el.classList.toggle("active", el.dataset.fsm === key));
+    $("nowIco").textContent = s.ico;
+    $("nowTitle").textContent = s.title;
+    $("nowDesc").textContent = s.desc;
+    $("nowBadge").textContent = s.badge;
+    $("nowBadge").className = "badge " + s.cls;
+
+    // Scene reactions
+    $("robot").style.left = POS[key] + "%";
+    body.classList.toggle("night", key === "sleep");
+    body.classList.toggle("eco", key === "eco");
+    body.classList.toggle("slow", key === "eco");
+    body.classList.toggle("extract", key === "wait");
+    const moving = key === "field" || key === "barn" || key === "eco";
+    body.classList.toggle("moving", moving);
+  }
+
+  // ── FSM detection from firmware log lines (mirrors the engineering dashboard) ──
+  // "SOFTWARE DISABLED" is NOT an eco cue — it fires on every normal grab.
+  const RULES = [
+    [/Waiting for Extraction|Drop zone reached|Drop node .* reached|releasing grip/i, "wait"],
+    [/Eco-?Mode ENGAGED|non-essential sensors off/i,                                  "eco"],
+    [/Eco-?Mode CLEARED|solar restored|Moving to Barn|\[RETURN\]|Home Node Reached|Home .* reached|Aligning to EAST/i, "barn"],
+    [/Loading|weight sensor|bin full|\[GRAB\]|\[GRIPPER\]/i,                          "load"],
+    [/Moving to Field|\[SEARCH\]|Target Node Reached|Aligning to WEST/i,              "field"],
+    [/Sleep Mode|Robot Halted|EMERGENCY STOP|\[BOOT\]|^===/i,                         "sleep"],
+  ];
+  function detect(text) {
+    for (const [re, key] of RULES) if (re.test(text)) { apply(key); return; }
+  }
+
+  // ── WebSocket link (served by the ESP32; ?host= overrides for file:// preview) ──
+  let ws = null, manualClose = false, reconnectTimer = null, ecoOn = false;
+  function wsUrl() {
+    const q = new URLSearchParams(location.search).get("host");
+    if (q) return "ws://" + q + "/ws";
+    if (location.protocol === "file:") return "ws://mecanumcar.local/ws";
+    return "ws://" + location.host + "/ws";
+  }
+  function setConn(label, cls) { $("connLabel").textContent = label; $("dot").className = "dot" + (cls ? " " + cls : ""); }
+  function setControls(on) { ["btnStart","btnCloud","btnStop","btnReset"].forEach((id) => $(id).disabled = !on); }
+
+  function connect() {
+    manualClose = false;
+    setConn("connecting…", "");
+    try { ws = new WebSocket(wsUrl()); }
+    catch (e) { setConn("error", "err"); scheduleReconnect(); return; }
+    ws.addEventListener("open", () => { setConn("live", "on"); setControls(true); });
+    ws.addEventListener("message", (ev) => {
+      String(ev.data).split(/\r?\n/).forEach((l) => { if (l.length) { detect(l); $("ticker").textContent = l; } });
+    });
+    ws.addEventListener("close", () => {
+      setConn("offline", ""); setControls(false); ws = null;
+      apply("sleep"); setCloud(false);
+      if (!manualClose) scheduleReconnect();
+    });
+    ws.addEventListener("error", () => setConn("error", "err"));
+  }
+  function scheduleReconnect() { clearTimeout(reconnectTimer); reconnectTimer = setTimeout(() => { if (!ws && !manualClose) connect(); }, 2000); }
+  function send(cmd) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(cmd); }
+
+  function setCloud(on) { ecoOn = on; $("btnCloud").classList.toggle("on", on); $("btnCloud").textContent = on ? "☀ Clear the cloud" : "☁ Cloud passes (Eco-Mode)"; }
+
+  $("btnStart").addEventListener("click", () => send("SEARCH:1"));   // full harvest mission (RED, row 1)
+  $("btnStop").addEventListener("click", () => send("STOP"));
+  $("btnReset").addEventListener("click", () => send("RESET"));
+  $("btnCloud").addEventListener("click", () => { const next = !ecoOn; send("ECO:" + (next ? 1 : 0)); setCloud(next); });
+
+  apply("sleep");
+  connect();
+  window.addEventListener("beforeunload", () => { manualClose = true; if (ws) ws.close(); });
+})();
+</script>

@@ -34,6 +34,7 @@
 #include <ESPAsyncWebServer.h>
 #include "secrets.h"
 #include "dashboard_html.h"
+#include "showcase_html.h"
 
 // The Uno's Serial (FinalSequence.cpp) is 9600 baud.
 #define UNO_BAUD 9600
@@ -122,6 +123,14 @@ void setup() {
   server.on("/", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
     AsyncWebServerResponse *res = req->beginResponse_P(
         200, "text/html; charset=utf-8", DASHBOARD_HTML_GZ, DASHBOARD_HTML_GZ_LEN);
+    res->addHeader("Content-Encoding", "gzip");
+    req->send(res);
+  });
+
+  // Demo-day showcase view — same telemetry, story-driven presentation.
+  server.on("/showcase", HTTP_GET | HTTP_HEAD, [](AsyncWebServerRequest *req) {
+    AsyncWebServerResponse *res = req->beginResponse_P(
+        200, "text/html; charset=utf-8", SHOWCASE_HTML_GZ, SHOWCASE_HTML_GZ_LEN);
     res->addHeader("Content-Encoding", "gzip");
     req->send(res);
   });
