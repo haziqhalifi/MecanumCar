@@ -235,20 +235,31 @@ const int ITEM_DETECT_DISTANCE_CM = 40;
 // reach the block from this standoff; stopping closer makes the chassis collide
 // with the block (and the colour read is taken here too, so it must not ram it).
 // Empirical — tune on the real car: too large and the closing claw misses the
-// block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm.
-// Calibrated on the car: ~7cm gives a reliable colour read; 6cm COLLIDES with the
-// block. Was 8cm, but at that standoff the closing jaws DON'T REACH the block —
-// they swing forward but stop short. Lowered to 7cm so the gripper can actually
-// close on the block while staying above the 6cm chassis-collision point. This is
-// the tight window between under-reach (>=8) and collision (<=6); if the chassis
-// now bumps the block, raise back toward 8 — if the jaws still miss, the reach
-// itself is short and CLAW_CLOSED_ANGLE / the jaw linkage needs adjusting, not this.
-const int GRAB_APPROACH_DISTANCE_CM = 7;
+// block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm,
+// then 8cm (jaws under-reached), then 7cm — and at 7cm the chassis COLLIDES, so
+// it is now back at 8cm. Colour reads reliably at ~7cm and 6cm definitely
+// collides, so the usable window is narrow and BOTH failure modes have now been
+// observed inside it: <=7 bumps the block, >=8 has previously left the closing
+// jaws short of it.
+//
+// This value has therefore already round-tripped 8 -> 7 -> 8. If the jaws miss
+// again at 8cm, do NOT lower it back to 7 — that just reintroduces the collision
+// and restarts the loop. The remaining slack is in the gripper, not the standoff:
+// adjust CLAW_CLOSED_ANGLE or the jaw linkage so the jaws close fully at 8cm.
+const int GRAB_APPROACH_DISTANCE_CM = 8;
 // Colour is only TRUSTED for the grab/search DECISION when the block is this close
 // (the ~7cm calibrated read distance, plus margin). The raw sensor still reads at
-// any distance for the live bench, but grabColorIfMatch ignores far reads — beyond
-// this range the sensor sees the floor and false-positives BLUE, which would make
-// the search reject the right block or grab the wrong one.
+// any distance for the live bench, but grabColorIfMatch ignores far reads.
+//
+// 10cm is the measured EDGE of usable signal, not a comfortable margin. A 4/7/10cm
+// CAL sweep of all three blocks still classified every one correctly at 10cm, so
+// this is not a false-positive zone (an earlier note claimed red collapses to BLUE
+// past ~9cm — that did not reproduce; red's blue channel stays 12%+ off). But at
+// 10cm some channels read BRIGHTER than at 7cm, which is physically impossible for
+// reflected light: the block has stopped dominating and the sensor is largely
+// reading ambient. Classification survives there on a thin, luck-dependent margin.
+// Prefer to read nearer the 8cm standoff; if ambient light changes, 10cm is the
+// first thing that breaks, and lowering this to 8 is the correct response.
 const int COLOR_DECISION_DISTANCE_CM = 10;
 // Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
 // still used by the scripted paths' floor). Lets a caller start slower than
@@ -308,10 +319,10 @@ const unsigned long REVERSE_BUMP_MS = 100;
 const unsigned long DROP_BRAKE_MS = 130;
 // After counting the X=9 drop line, creep a little further FORWARD into the drop
 // area before stopping, so the block is set down inside the zone rather than right
-// on its edge. Runs at the gentle PATH_APPROACH_SPEED crawl. This replaces the old
-// reverse-brake (which pulled the car back onto the line); raise for a deeper push
-// into the zone, lower it — or set to 0 — to stop closer to the X=9 line.
-const unsigned long DROP_FORWARD_NUDGE_MS = 250;
+// on its edge. Runs at the gentle PATH_APPROACH_SPEED crawl. Currently 0: the car
+// must stop ON the (9,3) junction, and DROP_BRAKE_MS is what holds it there. Raise
+// this only if the claw geometry needs the block set down forward of the sensors.
+const unsigned long DROP_FORWARD_NUDGE_MS = 0;
 // Final alignment settle: once the drop line is reached, goToDrop() runs a brief
 // in-place line-centering phase BEFORE the forward nudge. It only STEERS to square
 // the chassis onto the line (corrections fire, but it never advances straight),
@@ -324,8 +335,9 @@ const unsigned long DROP_ALIGN_SETTLE_MS = 600;
 // Reverse distance after releasing the block at the drop zone, BEFORE the 180°
 // spin back toward home. The plain gridSlightReverse (REVERSE_BUMP_MS=100) left
 // the car too close and the spinning chassis clipped ("slashed") the block it had
-// just set down — especially now that DROP_FORWARD_NUDGE_MS pushes it deeper into
-// the zone first. This backs off far enough that the 180° turn swings clear.
+// just set down. This backs off far enough that the 180° turn swings clear. Note
+// it was tuned when DROP_FORWARD_NUDGE_MS still pushed the car deeper into the
+// zone; with the nudge now 0 the car stops shorter, so this may be reducible.
 // Raise if the spin still catches the block; lower if it reverses too far to
 // re-acquire the home junction. moveCoord() on the return counts the junction
 // crossing, so a longer reverse here does NOT throw off where it lands.
@@ -894,24 +906,29 @@ int gridDetectColorValue() {
     // reflect red strongest (red channel smallest for both), so "smallest wins"
     // alone can't tell them apart — the LEAST-reflected channel is what does.
     //
-    // Calibrated on the car with each block held at ~5-6cm (see CAL command):
-    //   RED    R=1007 G=1249 B=1061  -> red most reflected, GREEN least (blue<green)
-    //   YELLOW R=789  G=892  B=976   -> red most reflected, BLUE least  (green<blue)
-    //   BLUE   R=1245 G=1238 B=982   -> blue most reflected
-    // Past ~7cm the signal weakens and the three channels bunch to within a few
-    // percent (red/yellow then collapse to blue) — reads MUST be taken close for
-    // this to hold. See COLOR_DECISION_DISTANCE_CM and the grab standoff.
+    // Calibrated on the car with each block swept 4/7/10cm (see CAL command).
+    // Raw pulse widths at the ~7-8cm grab standoff:
+    //   RED    R=2023 G=3267 B=2766  -> red most reflected, GREEN least
+    //   YELLOW R=1774 G=2161 B=2392  -> red most reflected, BLUE  least
+    //   BLUE   R=2852 G=2842 B=1953  -> blue most reflected
+    // Signal decays with distance and the channels bunch, so both red-family G/B
+    // ratios converge upward as the block gets farther away. Worst case is 10cm,
+    // where the two bands are closest — see the threshold note below.
     int result = ANY;
     if (blue < red && blue < green) {
         result = BLUE;                          // blue most reflected
     } else if (red < blue || red < green) {
         // Red strongly reflected -> RED or YELLOW. A raw blue<green compare has
         // too thin a margin and FLIPS on yellow past ~6cm (yellow's green/blue
-        // cross over), so use the green/blue RATIO instead, which stays separated:
-        //   RED    G/B ~1.16-1.18 (green far less reflected than blue)
-        //   YELLOW G/B ~0.83 (close) .. ~1.09 (at 8cm) — never reaches RED's band
-        // Threshold 1.12 splits every calibration sample, incl. yellow at 7-8cm.
-        result = (green > blue * 1.12f) ? RED : YELLOW;
+        // cross over), so use the green/blue RATIO instead, which stays separated.
+        // Measured bands (4cm / 7-8cm / 10cm):
+        //   RED    1.26  / 1.18  / 1.154  <- floor is 1.154, at 10cm
+        //   YELLOW 0.593 / 0.903 / 1.022  <- ceiling is 1.022, at 10cm
+        // Both climb toward each other as distance kills the signal, so the bands
+        // are tightest at 10cm with a 0.132 gap. 1.09 is that gap's midpoint,
+        // giving symmetric +-0.066 worst-case margin (and 0.09/0.19 at the 7-8cm
+        // standoff where the mission actually reads).
+        result = (green > blue * 1.09f) ? RED : YELLOW;
     }
     // else: green somehow most reflected -> not a target color, leave as ANY.
 
@@ -1351,8 +1368,8 @@ void goToDrop() {
         // Line-follow with the SAME crawl speed, correction boost and tick as the
         // proven block-grab approach, so the drive out to the drop point tracks
         // the line just as smoothly. A single consistent speed keeps the steer
-        // differential gentle (no weaving), and the reverse-brake below — not a
-        // slower crawl — is what nails the precise stop on the X=9 line.
+        // differential gentle (no weaving), and the reverse-brake after the loop —
+        // not a slower crawl — is what nails the precise stop on the X=9 line.
         if (Left == HIGH && Center == HIGH && Right == HIGH) {
             // Junction cross — count one coordinate step east on its leading edge.
             if (!activeJunctionFlag) {
@@ -1384,6 +1401,17 @@ void goToDrop() {
         delay(40);   // slightly finer than the 60 ms grab tick so corrections fire
                      // more often on the straight run — smoother line tracking.
     }
+    // Reverse-brake the instant X=9 is counted. The loop breaks on the LEADING edge
+    // of the drop band, with the car still rolling; without this pulse it coasts
+    // through the (wide) 9,3 mark before anything else runs. Kill that momentum
+    // here so the settle below starts from a car actually parked on the node.
+    if (!emergencyStopActive && DROP_BRAKE_MS > 0) {
+        gridSetSpeed(SPEED_REVERSE_BUMP);
+        mecCar.Back();
+        unsigned long brakeStart = millis();
+        while (millis() - brakeStart < DROP_BRAKE_MS) { if (checkEmergencyStop()) break; }
+        gridStop();
+    }
     // Final alignment settle: square the chassis onto the drop mark BEFORE moving
     // in to release. The drive-out crawl can arrive a touch skewed (near the stall
     // floor there isn't much correction authority per tick), which sets the block
@@ -1392,12 +1420,14 @@ void goToDrop() {
     //
     // The X=9 drop mark is a WIDE band, so "centred" is NOT "both edges off the
     // line" — on a wide mark the outer L/R sensors sit ON the band and read HIGH.
-    // Squared-up is the SYMMETRIC state: L and R AGREE (both HIGH = sitting square
-    // on the wide band, or both LOW = clear of it). We only steer when they
-    // DISAGREE (one edge on the mark, the other off = the chassis is skewed), and
-    // count as aligned once they agree for two consecutive ticks. This works for a
-    // thin line too (there L==R==LOW is the centred state). Fine 25 ms tick so the
-    // squaring is quick and doesn't overshoot into a weave.
+    // Squared-up is BOTH edges ON the band (L and R both HIGH). Accepting any
+    // L==R state instead also accepts both-LOW, which is the car having rolled
+    // CLEAR OFF the far side of the band — indistinguishable from square, so the
+    // settle would break early and the forward nudge would push it past the drop
+    // zone. Requiring both-HIGH means only a car actually sitting on the mark
+    // counts as aligned. We steer whenever the edges disagree (one on the mark,
+    // one off = skewed), and confirm alignment over two consecutive ticks. Fine
+    // 25 ms tick so the squaring is quick and doesn't overshoot into a weave.
     if (!emergencyStopActive && DROP_ALIGN_SETTLE_MS > 0) {
         unsigned long settleStart = millis();
         uint8_t alignedTicks = 0;
@@ -1405,11 +1435,18 @@ void goToDrop() {
             if (checkEmergencyStop()) return;
             uint8_t Left = digitalRead(LINE_LEFT_PIN);
             uint8_t Right = digitalRead(LINE_RIGHT_PIN);
-            if (Left == Right) {
-                // Edges agree → chassis is square on (or clear of) the wide band.
+            if (Left == HIGH && Right == HIGH) {
+                // Both edges on the wide band → chassis is square ON the mark.
                 // Confirm over two ticks so a momentary reading doesn't end early.
                 gridStop();
                 if (++alignedTicks >= 2) break;
+            } else if (Left == LOW && Right == LOW) {
+                // Both edges clear of the band. Either the car has not reached the
+                // mark yet or it has rolled off the far side; neither is aligned,
+                // so don't count it — hold position and let the settle window
+                // expire rather than nudging forward from an unknown pose.
+                alignedTicks = 0;
+                gridStop();
             } else if (Right == HIGH) {
                 // Right edge on the mark, left off → skewed; arc right to square up.
                 alignedTicks = 0;
@@ -1423,10 +1460,9 @@ void goToDrop() {
         }
         gridStop();
     }
-    // Nudge a little further FORWARD into the drop area before stopping, so the
-    // block is released inside the zone instead of right on the X=9 edge. Keep the
-    // gentle crawl speed so it eases in straight and the momentum stays low enough
-    // that a passive stop settles it without coasting far past the target.
+    // Optional nudge further FORWARD into the drop area before stopping. Disabled
+    // (DROP_FORWARD_NUDGE_MS = 0) while the car is required to stop on the (9,3)
+    // junction itself; the brake above is what sets the final position.
     if (!emergencyStopActive && DROP_FORWARD_NUDGE_MS > 0) {
         gridSetSpeed(PATH_APPROACH_SPEED);
         mecCar.Advance();
