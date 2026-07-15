@@ -53,7 +53,18 @@ volatile bool haveCmd = false;
 // Assembles Serial2 bytes into lines to broadcast to the browser.
 String unoLineBuf = "";
 
+// Last [POS] line seen from the Uno, retained and replayed to each client as it
+// connects. The Uno only emits [POS] when the pose CHANGES, but the dashboard's
+// map needs it as STATE: a browser that wasn't connected at the instant a line
+// went out has no way to ask for it, and falls back to its hardcoded home pose —
+// so a dashboard opened or reloaded mid-run drew the car at home until it
+// happened to cross the next junction. Retaining the pose here closes that
+// window on connect. [POS] carries an absolute x,y,h (never a delta), so
+// replaying a stale one is always safe: the next real line supersedes it.
+String lastPosLine = "";
+
 void broadcastLine(const String &line) {
+  if (line.startsWith("[POS]")) lastPosLine = line;
   // WebSocket text frame per line; the browser splits on newlines anyway.
   ws.textAll(line);
 }
@@ -65,6 +76,9 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       Serial.printf("[ws] client #%u connected from %s\n",
                     client->id(), client->remoteIP().toString().c_str());
       client->text("[dashboard] websocket connected to ESP32 bridge");
+      // Seed the map with the pose the Uno last reported, so a dashboard opened
+      // mid-run shows where the car actually is instead of the home default.
+      if (lastPosLine.length()) client->text(lastPosLine);
       break;
     case WS_EVT_DISCONNECT:
       Serial.printf("[ws] client #%u disconnected\n", client->id());

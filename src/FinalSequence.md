@@ -29,8 +29,38 @@ it is enabled only for the approach-and-grab phases (see below).
 
 ## Core movement primitives
 
-- **`gridMoveForwardBlocks(targetBlocks, startSpeed)`** — line-follows forward, counting a "block" each time all 3 sensors go HIGH together (a junction) after being off it. Slows by `-5` PWM per block already crossed, floored at `SPEED_MIN`. On the **final block** (heading to the last junction) it drops to `FINAL_BLOCK_CRAWL_SPEED` so it eases onto the last grid. After the target is reached, creeps forward an extra `CENTER_OFFSET_MS` to settle centered on the junction, then stops.
-- **`gridMoveForwardOneCoord(startSpeed)`** — same idea but for exactly one grid coordinate step: drives blind for 140ms to clear the current junction, then line-follows until the next full 3-sensor junction, then applies the same `CENTER_OFFSET_MS` settle.
+- **`gridMoveForwardBlocks(targetBlocks, startSpeed)`** — line-follows forward, counting a "block" each time `JunctionDetector` completes a crossing (see [Junction detection](#junction-detection)). Slows by `-5` PWM per block already crossed, floored at `SPEED_MIN`. On the **final block** (heading to the last junction) it drops to `FINAL_BLOCK_CRAWL_SPEED` so it eases onto the last grid. After the target is reached, creeps forward an extra `CENTER_OFFSET_MS` to settle centered on the junction, then stops.
+- **`gridMoveForwardOneCoord(startSpeed)`** — same idea but for exactly one grid coordinate step: clears the current junction **by sensor state** (drives until both outer sensors are off the cross, debounced by `JUNCTION_CLEAR_MIN_MS`, backstopped by `JUNCTION_CLEAR_TIMEOUT_MS`) rather than on a blind timer, then line-follows until `JunctionDetector` finds the next junction, then applies the same `CENTER_OFFSET_MS` settle.
+
+### Junction detection
+
+A junction is a **cross**, and both outer sensors have to pass over it. The
+tempting test — one sample reading all 3 sensors HIGH at once — assumes the outer
+sensors reach the cross line *together*, and they don't: **LEFT is mounted ahead
+of CENTER/RIGHT** (the same offset that used to break the left 90°, see
+`TURN_BLIND_LEFT_MS`). On a thinner cross, LEFT goes HIGH and falls back LOW
+before RIGHT ever arrives, so no sample ever sees all three and the crossing is
+never counted.
+
+That matters more than it sounds, because the forward primitives stop on a
+**count, not a distance**. A missed cross doesn't cut the move short — it runs the
+car *on* to find its count further down the line, while the tracked pose (and so
+the dashboard map) still reads the intended target. A `FWD 3` that drops two
+crossings stops the car on column 2 still reporting column 4.
+
+So `JunctionDetector` latches each outer sensor's HIGH for `JUNCTION_LATCH_MS`
+and calls it a crossing once **both latches are live** — sensor offset and line
+width then only change how far apart the two hits land, not whether the crossing
+registers. It's shared by every loop that seeks a junction: both phases of the
+forward primitives, plus `backOffBlock()` and `reverseOneCoordEast()`.
+
+`JUNCTION_LATCH_MS` (120) is the tuning knob and it's squeezed from both sides:
+long enough to span the LEFT-to-RIGHT offset at `SPEED_START_FAST`, short enough
+that a line-follow wobble — which trips one outer and then the other as
+`TURN_CORRECTION_BOOST` yanks the car back — can't fake a cross. **Raise** it if
+crossings are still missed; **lower** it if the car counts phantom nodes on the
+straights, since a phantom count on an outbound leg counts through to column 1
+and drives the chassis into the block.
 - **`gridRotateLeft90` / `gridRotateRight90`** — sensor-terminated 90° pivot (see [Turning](#turning-90)). Return `false` early if interrupted by E-STOP.
 - **`gridSteer(baseSpeed, boost, steerLeft)`** — the line-follow **correction**: both sides keep driving forward, but the outer side runs `boost` PWM faster than the inner side, arcing the car back onto the line. Replaces the old pivot-style `Turn_Left/Right` correction (which reversed one side and read as jerky).
 - **`gridSlightReverse()`** — brief reverse bump (`REVERSE_BUMP_MS` at `SPEED_REVERSE_BUMP`) used to back off the line right after a grab, before turning.
@@ -249,6 +279,34 @@ Uno espSerial (SoftwareSerial, pins 11 RX / 10 TX) @ 9600
    ▼
 FinalSequence.cpp
 ```
+
+### Pose sync (`[POS]`)
+
+The dashboard's live map is driven entirely by `[POS] x,y,h` lines, emitted by
+`reportPosition()` from inside the motion primitives whenever the tracked pose
+changes. The pose is **absolute, never a delta**, which is what makes the whole
+chain tolerant: repeating a `[POS]` is idempotent, and any later line supersedes
+an earlier one.
+
+That property is load-bearing, because a change-only broadcast makes the map's
+correctness depend on the browser having caught *every* line. It can't — a client
+that connects after the last move has no way to ask for the pose, and falls back
+to the map's hardcoded home default, so a dashboard opened or reloaded mid-run
+drew the car at home until it happened to cross the next junction. Two things
+close that gap:
+
+- **The ESP32 retains the last `[POS]`** (`lastPosLine` in `main.cpp`) and
+  replays it to each client on `WS_EVT_CONNECT`, so a fresh or reconnecting
+  browser gets the true pose immediately.
+- **The Uno heartbeats `[POS]` every `POS_HEARTBEAT_MS`** (2s) from `loop()`, so
+  a dropped line self-heals and the ESP32's cache repopulates after a bridge
+  reboot. It is driven from `loop()` **only** — `loop()` runs solely when the car
+  is idle (a mission blocks it to completion), so the heartbeat never adds serial
+  traffic mid-move. That restriction matters: `espSerial` is bit-banged
+  `SoftwareSerial`, whose `write()` blocks with **interrupts disabled** for ~1ms
+  per byte, which would stall both the line-sensor sampling and `millis()` itself
+  underneath `JunctionDetector`. During a move, the per-crossing `[POS]` lines
+  already keep the map current.
 
 - The ESP32 joins WiFi and serves the dashboard page itself (embedded gzipped
   in `esp32-wifi-bridge/src/dashboard_html.h`, generated from

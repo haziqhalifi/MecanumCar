@@ -83,6 +83,22 @@ bool ecoBypass = false;
 unsigned long lastTelemetryMillis = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 1000; // ms between automatic reports
 
+// Pose heartbeat: re-announce [POS] while idle even though nothing has moved.
+// [POS] is otherwise only emitted when the pose CHANGES, which makes the
+// dashboard map's correctness depend on it having caught every single line —
+// one dropped line (or a browser that connected after the last move) leaves the
+// map stale with no way to ask for a resync. Since [POS] is an ABSOLUTE pose and
+// not a delta, simply repeating it is idempotent and makes the map self-healing.
+//
+// Deliberately driven from loop() and nowhere else: loop() only runs when the
+// car is idle (a mission blocks it until it finishes), so this never adds serial
+// traffic mid-move. That matters — espSerial is bit-banged SoftwareSerial, whose
+// write() blocks with interrupts DISABLED for ~1ms per byte, which would both
+// stall the line-sensor sampling and stop millis() advancing underneath
+// JunctionDetector. During a move the per-crossing [POS] lines already cover us.
+unsigned long lastPosHeartbeatMillis = 0;
+const unsigned long POS_HEARTBEAT_MS = 2000;
+
 // ── Global Position and Heading Tracking ────────────────────────────────────
 // Home/start is node (7,3): the car begins in the START zone, which sits east
 // of the 6×6 collecting grid. A SEARCH mission drives 6 junctions west from
@@ -184,6 +200,37 @@ const unsigned long CENTER_OFFSET_MS = 110;
 // move forever (it falls through to the old time-based behaviour).
 const unsigned long JUNCTION_CLEAR_MIN_MS = 60;
 const unsigned long JUNCTION_CLEAR_TIMEOUT_MS = 900;
+
+// ── Junction detection (sensor-offset independent) ──────────────────────────
+// Same lesson as the clearing constants above, one step further along: a
+// junction is a CROSS, and the obvious test for one — a single sample reading
+// all three sensors HIGH at once — assumes the outer sensors reach the cross
+// line together. They don't. LEFT is mounted AHEAD of CENTER/RIGHT (the same
+// offset that used to break the left 90; see TURN_BLIND_LEFT_MS), so on a
+// thinner cross LEFT can go HIGH and fall back LOW before RIGHT ever arrives,
+// and no sample ever sees all three. That crossing then never counts.
+//
+// Which is worse than it sounds, because these moves stop on a COUNT, not on a
+// distance: a missed cross doesn't cut the move short, it runs the car ON to
+// find its count further down the line, while the tracked pose — and so the
+// dashboard map — still reads the intended target. A FWD 3 that drops two
+// crossings stops the car on column 2 still believing it is on column 4.
+//
+// So detect the cross by "both outers saw it within the same short window"
+// instead of "both were HIGH in the same sample": latch each outer sensor's
+// HIGH for JUNCTION_LATCH_MS and call it a crossing once both latches are live.
+// Sensor offset and line width then only change how far APART the two hits
+// land, not whether the crossing registers at all.
+//
+// JUNCTION_LATCH_MS is the tuning knob, and it is squeezed from both sides:
+// long enough to span the LEFT-to-RIGHT offset at SPEED_START_FAST, short
+// enough that a line-follow wobble — which trips one outer and then the other
+// as TURN_CORRECTION_BOOST yanks the car back — can never fake a cross. Raise
+// it if crossings are still missed. LOWER it if the car counts phantom nodes on
+// the straights: a phantom count on an outbound leg counts through to column 1
+// and drives the chassis into the block.
+const unsigned long JUNCTION_LATCH_MS = 120;
+
 const uint8_t SPEED_ROTATE = 60;
 // Blind-spin duration before we start hunting for the new perpendicular line.
 // Must be long enough to rotate PAST the too-early black detection (car stops
@@ -469,6 +516,114 @@ bool checkOffGridStop(unsigned long &lostSince) {
     return true;
 }
 
+// Outer-sensor latches for one forward move — the shared junction detector for
+// every counting loop below. See JUNCTION_LATCH_MS for why a crossing is timed
+// across two samples rather than read from one.
+struct JunctionDetector {
+    unsigned long leftSeenAt;
+    unsigned long rightSeenAt;
+    bool latched;
+    // Gap between the two outer hits on the crossing update() last fired on:
+    // +ve = LEFT led, -ve = RIGHT led. This is the real, measured LEFT-to-RIGHT
+    // sensor offset at speed — the number JUNCTION_LATCH_MS has to span, and
+    // which we have so far only guessed at. Recorded by the crossing trace.
+    long lastOuterGapMs;
+
+    // startOnJunction: true when the move begins with the car parked ON a node,
+    // so the cross already under the wheels isn't counted as a fresh crossing.
+    JunctionDetector(bool startOnJunction)
+        : leftSeenAt(0), rightSeenAt(0), latched(startOnJunction),
+          lastOuterGapMs(0) {}
+
+    // Feed one sensor sample. Returns true exactly once per crossing, on the
+    // sample that completes it.
+    bool update(uint8_t left, uint8_t right) {
+        unsigned long now = millis();
+        if (left == HIGH) leftSeenAt = now;
+        if (right == HIGH) rightSeenAt = now;
+
+        bool onCross = leftSeenAt != 0 && rightSeenAt != 0 &&
+                       (now - leftSeenAt) < JUNCTION_LATCH_MS &&
+                       (now - rightSeenAt) < JUNCTION_LATCH_MS;
+        // Not on a cross — re-arm for the next one. Note the latches outlive the
+        // sensors by JUNCTION_LATCH_MS, so this also debounces the roll-off.
+        if (!onCross) { latched = false; return false; }
+        if (latched) return false;       // still the crossing we already counted
+        latched = true;
+        lastOuterGapMs = (long)leftSeenAt - (long)rightSeenAt;
+        leftSeenAt = rightSeenAt = 0;    // spent: this cross can't count twice
+        return true;
+    }
+};
+
+// ── Crossing trace (diagnostic) ─────────────────────────────────────────────
+// Answers the two questions we can't settle by watching the car: is a forward
+// move DROPPING crossings, and how far apart do the outer sensors really land?
+//
+// Recorded into RAM and dumped only once the car has STOPPED, because printing
+// from inside the move would destroy the measurement: espSerial is bit-banged
+// SoftwareSerial whose write() blocks with interrupts disabled ~1ms/byte, so a
+// log line mid-move stalls the sensor sampling and millis() alike — the very
+// signals being measured. (The per-crossing [POS] line already pays that cost;
+// see POS_HEARTBEAT_MS. That's a real overshoot source, but it lands after the
+// count, so it can't hide a crossing.)
+//
+// Read the dump like this:
+//   * sincePrev — ms between consecutive COUNTED crossings. On an even run
+//     these should cluster around one cell-time. A gap that is ~2x the others
+//     is a crossing the detector DROPPED, and it's proof rather than inference.
+//   * outerGap — ms between the LEFT and RIGHT hits (+ve = LEFT led, as the
+//     forward-mounted LEFT sensor should). This is the offset JUNCTION_LATCH_MS
+//     must span: set the latch comfortably above the largest gap seen, but below
+//     the smallest sincePrev, or a wobble can bridge two crossings into one.
+// Set to 0 to compile the trace out (it costs flash, which is at ~84%).
+#define CROSSING_TRACE 1
+#if CROSSING_TRACE
+struct CrossingRec {
+    uint16_t sincePrevMs;
+    int16_t outerGapMs;
+};
+const uint8_t CROSSING_TRACE_MAX = 10;
+CrossingRec crossingTrace[CROSSING_TRACE_MAX];
+uint8_t crossingTraceCount = 0;
+unsigned long crossingTracePrevMs = 0;
+
+void crossingTraceReset() {
+    crossingTraceCount = 0;
+    crossingTracePrevMs = millis();
+}
+
+void crossingTraceRecord(long outerGapMs) {
+    unsigned long now = millis();
+    if (crossingTraceCount < CROSSING_TRACE_MAX) {
+        crossingTrace[crossingTraceCount].sincePrevMs = (uint16_t)(now - crossingTracePrevMs);
+        crossingTrace[crossingTraceCount].outerGapMs = (int16_t)outerGapMs;
+        crossingTraceCount++;
+    }
+    crossingTracePrevMs = now;
+}
+
+// Call only after gridStop() — never mid-move.
+void crossingTraceDump() {
+    if (!crossingTraceCount) return;
+    Bridge.print(F("[TRACE] crossings="));
+    Bridge.println(crossingTraceCount);
+    for (uint8_t i = 0; i < crossingTraceCount; i++) {
+        Bridge.print(F("[TRACE]  #"));
+        Bridge.print(i + 1);
+        Bridge.print(F(" sincePrev="));
+        Bridge.print(crossingTrace[i].sincePrevMs);
+        Bridge.print(F("ms outerGap="));
+        Bridge.print(crossingTrace[i].outerGapMs);
+        Bridge.println(F("ms"));
+    }
+}
+#else
+#define crossingTraceReset()
+#define crossingTraceRecord(g)
+#define crossingTraceDump()
+#endif
+
 bool gridRotateLeft90() {
     if (checkEmergencyStop()) return false;
     Bridge.println(F("\n[TURN] Symmetrical Spin 90 Degrees Left..."));
@@ -527,9 +682,10 @@ bool gridRotateRight90() {
 void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
     if (checkEmergencyStop()) return;
     int junctionCount = 0;
-    bool onJunction = true;
+    JunctionDetector junctions(true);   // this move starts parked on a node
     unsigned long telemetryTickMillis = millis();
     unsigned long lineLostSince = 0;
+    crossingTraceReset();
 
     while (junctionCount < targetBlocks) {
         if (checkEmergencyStop()) return;
@@ -537,6 +693,15 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
+
+        // Count first, then steer: the detector owns the crossing decision, and
+        // the branches below are only about keeping the car on the line.
+        if (junctions.update(Left, Right)) {
+            junctionCount++;
+            crossingTraceRecord(junctions.lastOuterGapMs);
+            advanceTrackedNode();   // crossed a junction — pose moves one node
+            if (junctionCount == targetBlocks) break;
+        }
 
         int calculatedSpeed = startSpeed - (junctionCount * 5);
         if (calculatedSpeed < SPEED_MIN) calculatedSpeed = SPEED_MIN;
@@ -547,26 +712,19 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         uint8_t currentSpeed = (uint8_t)calculatedSpeed;
 
         if (Left == HIGH && Center == HIGH && Right == HIGH) {
-            if (!onJunction) {
-                junctionCount++;
-                onJunction = true;
-                advanceTrackedNode();   // crossed a junction — pose moves one node
-                if (junctionCount == targetBlocks) break;
-            }
-            gridSetSpeed(currentSpeed);
-            mecCar.Advance();
+            gridSetSpeed(currentSpeed); mecCar.Advance();
         } else if (Left == LOW && Center == HIGH && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
+            gridSetSpeed(currentSpeed); mecCar.Advance();
         } else if (Left == LOW && Center == LOW && Right == HIGH) {
-            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
+            gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
         } else if (Left == HIGH && Center == LOW && Right == LOW) {
-            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
+            gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
         } else if (Left == HIGH && Center == HIGH && Right == LOW) {
-            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
+            gridSteer(currentSpeed, TURN_CORRECTION_BOOST, true);
         } else if (Left == LOW && Center == HIGH && Right == HIGH) {
-            onJunction = false; gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
+            gridSteer(currentSpeed, TURN_CORRECTION_BOOST, false);
         } else if (Left == LOW && Center == LOW && Right == LOW) {
-            onJunction = false; gridSetSpeed(currentSpeed); mecCar.Advance();
+            gridSetSpeed(currentSpeed); mecCar.Advance();
         }
 
         motionTelemetryTick(telemetryTickMillis);
@@ -579,6 +737,7 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         while(millis() - offsetStart < CENTER_OFFSET_MS) { if (checkEmergencyStop()) return; }
     }
     gridStop();
+    crossingTraceDump();   // car is stopped — safe to spend serial time now
 }
 
 void gridMoveForwardOneCoord(uint8_t startSpeed) {
@@ -615,6 +774,10 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         motionTelemetryTick(telemetryTickMillis);
     }
 
+    // Phase 2 — hunt the next junction. Phase 1 only exits once BOTH outers are
+    // LOW, so the detector starts off-cross: the first crossing it completes is
+    // a genuinely new node.
+    JunctionDetector junctions(false);
     while (true) {
         if (checkEmergencyStop()) return;
         if (checkOffGridStop(lineLostSince)) return;
@@ -622,7 +785,7 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
 
-        if (Left == HIGH && Center == HIGH && Right == HIGH) break;
+        if (junctions.update(Left, Right)) break;
         else if (Left == LOW && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
 
         else if (Left == LOW && Center == LOW && Right == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, false);
@@ -1071,12 +1234,14 @@ void resetCoordinates() {
 const int BLOCK_ROWS[3] = {1, 3, 5};
 const uint8_t SEARCH_APPROACH_SPEED = PATH_APPROACH_SPEED;
 
-// Column the search changes ROW on, both on the way to the first block and on
-// every hop between blocks. Column 4 is the clear middle of the collecting grid
-// and is the same column the scripted paths turn on, so a searched route and a
-// scripted route trace the same lane. It must stay well clear of the block
-// column (1) — changing row any nearer would sweep the car past the blocks.
-const int SEARCH_TURN_X = 4;
+// THE row-change lane. Every row change in the firmware happens on this column:
+// the search's run out to the first block, every hop between blocks, and the
+// carry-home return with a block held. Column 4 is the clear middle of the
+// collecting grid and the same column the scripted paths turn on, so every
+// route — searched, scripted, outbound or returning — traces the same lane.
+// It must stay well clear of the block column (1): changing row any nearer
+// would sweep the car past the blocks.
+const int ROW_CHANGE_X = 4;
 // Column the approach stops on: one node EAST of the block at column 1.
 // moveToGrab() creeps the last cell with the ultrasonic from here, so the car
 // never drives onto column 1 and clashes with the block.
@@ -1095,11 +1260,13 @@ static void backOffBlock() {
     // Cap the reverse so a missed junction can't run the car off the mat.
     unsigned long startTime = millis();
     const unsigned long BACKOFF_TIMEOUT_MS = 2500;
+    // The approach crept off the node, so we start off-cross. Reversing puts the
+    // offset LEFT sensor onto the cross LAST rather than first, but it's the same
+    // problem either way — the outers land at different times (JUNCTION_LATCH_MS).
+    JunctionDetector junctions(false);
     while (millis() - startTime < BACKOFF_TIMEOUT_MS) {
         if (checkEmergencyStop()) return;
-        if (digitalRead(LINE_LEFT_PIN) == HIGH &&
-            digitalRead(LINE_CENTER_PIN) == HIGH &&
-            digitalRead(LINE_RIGHT_PIN) == HIGH) {
+        if (junctions.update(digitalRead(LINE_LEFT_PIN), digitalRead(LINE_RIGHT_PIN))) {
             break; // back on the junction
         }
     }
@@ -1111,8 +1278,8 @@ static void backOffBlock() {
 // held block keeps leading and NO turn is needed). Assumes it starts on a
 // junction — e.g. right after backOffBlock: drives blind briefly to clear the
 // current junction cross, then reverses until the next junction (all 3 line
-// sensors HIGH). Bumps currentX by +1. Used by the post-grab return to pull back
-// onto the clear X=3 corridor without a 180° turn.
+// sensors HIGH). Bumps currentX by +1. Called repeatedly by the post-grab return
+// to pull back onto the clear column-4 row-change lane without a 180° turn.
 static void reverseOneCoordEast() {
     if (checkEmergencyStop()) return;
     Bridge.println(F("[RETURN] Reversing one node east onto the corridor..."));
@@ -1122,11 +1289,10 @@ static void reverseOneCoordEast() {
     while (millis() - t0 < 400) { if (checkEmergencyStop()) return; }
     unsigned long startTime = millis();          // then reverse to the next junction
     const unsigned long REVERSE_TIMEOUT_MS = 2500;
+    JunctionDetector junctions(false);           // the blind clear above left the cross
     while (millis() - startTime < REVERSE_TIMEOUT_MS) {
         if (checkEmergencyStop()) return;
-        if (digitalRead(LINE_LEFT_PIN) == HIGH &&
-            digitalRead(LINE_CENTER_PIN) == HIGH &&
-            digitalRead(LINE_RIGHT_PIN) == HIGH) {
+        if (junctions.update(digitalRead(LINE_LEFT_PIN), digitalRead(LINE_RIGHT_PIN))) {
             break;
         }
     }
@@ -1167,13 +1333,13 @@ int searchAndGrab(int targetColour, int startRow) {
 
         // Change row at column 4, then run straight west to the approach node.
         // moveCoord does its X move before its Y move, so targeting
-        // (SEARCH_TURN_X, row) first pulls the car out to column 4 and only then
+        // (ROW_CHANGE_X, row) first pulls the car out to column 4 and only then
         // changes rows — every row change, first block and inter-block hop
         // alike, happens on the clear column-4 lane rather than along the block
         // column. The second moveCoord is then a pure westward run (4 -> 2) with
         // no turn, which also lets the line-follow re-centre the car before the
         // ultrasonic creeps it onto the block. Same lane the scripted paths fly.
-        moveCoord(SEARCH_TURN_X, row);
+        moveCoord(ROW_CHANGE_X, row);
         if (emergencyStopActive) return -1;
         moveCoord(GRAB_APPROACH_X, row);
         if (emergencyStopActive) return -1;
@@ -1203,9 +1369,9 @@ int searchAndGrab(int targetColour, int startRow) {
 // Carries a just-grabbed block back and out to the drop zone. Entered right
 // after the grab with the car at column 2, currentY = the grabbed row, facing
 // WEST (block held in front). Route: back off to the block's junction, reverse
-// one more node east onto the clear X=3 corridor (still WEST-facing — no turn),
-// funnel onto the central row 3 ("path 2"), then run east through home out to
-// the drop node (9,3), where the caller releases the grip.
+// east onto the column-4 row-change lane (still WEST-facing — no turn), funnel
+// onto the central row 3 ("path 2"), then run east through home out to the drop
+// node (9,3), where the caller releases the grip.
 //
 // Turning: a block from row 1 or row 5 reaches row 3 with one 90° turn onto the
 // corridor and another 90° to face east — never a 180°. A block already on row 3
@@ -1217,10 +1383,18 @@ static void carryHomeViaRow3() {
 
     backOffBlock();                 // reverse to (2, grabbedRow) junction, facing WEST
     if (emergencyStopActive) return;
-    reverseOneCoordEast();          // reverse to (3, grabbedRow), still facing WEST
-    if (emergencyStopActive) return;
 
-    // Funnel onto the central row 3 along the X=3 corridor (rows 1/5 only).
+    // Reverse east onto the shared row-change lane (column 4) — the same column
+    // the outbound search and the scripted paths change row on, so the carried
+    // block travels the identical lane it came out on. Reversing (rather than
+    // turning) keeps the car facing WEST with the held block leading, so no turn
+    // is needed here and the block never sweeps across the grid.
+    while (currentX < ROW_CHANGE_X) {
+        reverseOneCoordEast();
+        if (emergencyStopActive) return;
+    }
+
+    // Funnel onto the central row 3 along the column-4 lane (rows 1/5 only).
     if (grabbedRow != 3) {
         int dir = (grabbedRow > 3) ? SOUTH : NORTH;
         turnToHeading(dir);
@@ -1303,8 +1477,8 @@ void searchGrabAndDrop(int targetColour, int startRow) {
     }
 
     // Carry the grabbed block back and out to the drop zone: reverse onto the
-    // X=3 corridor, funnel onto row 3, then run east to home and to the drop —
-    // avoiding a 180° turn except for a row-3 (path 2) block.
+    // column-4 row-change lane, funnel onto row 3, then run east to home and to
+    // the drop — avoiding a 180° turn except for a row-3 (path 2) block.
     carryHomeViaRow3();
     if (emergencyStopActive) return;
     delay(300);
@@ -1603,6 +1777,14 @@ void loop() {
     if (debugTelemetry && (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
         telemetryReport();
         lastTelemetryMillis = millis();
+    }
+
+    // Pose heartbeat — unconditional (not gated on debugTelemetry): the map is a
+    // core dashboard readout, not debug output, and this is the only thing that
+    // resyncs it after a dropped line. See POS_HEARTBEAT_MS.
+    if (millis() - lastPosHeartbeatMillis >= POS_HEARTBEAT_MS) {
+        reportPosition();
+        lastPosHeartbeatMillis = millis();
     }
 
     if (IrReceiver.decode()) {

@@ -1,0 +1,234 @@
+@startuml MecanumCar-Architecture
+' End-to-end architecture: browser -> ESP32 bridge -> Arduino Uno -> motors.
+' Sources: dashboard/*.html, esp32-wifi-bridge/src/main.cpp,
+'          src/FinalSequence.cpp, lib/MecanumCar_v2/*.
+
+title MecanumCar — Web to Motor Architecture
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam ArrowFontSize 11
+skinparam package {
+  BackgroundColor #FDFDFD
+  BorderColor #999999
+}
+
+'==================== TIER 1: BROWSER ====================
+package "Client tier — any browser on the LAN" #F4F8FF {
+  component "showcase.html\n<size:10>client presentation view — served at /</size>" as SHOWCASE
+  component "dashboard-wifi.html\n<size:10>engineering dashboard — served at /engineering</size>" as DASH
+
+  package "Dashboard modules" #EDF3FF {
+    component "Manual control\n<size:10>FWD:n, LFT, RGT, GRB:c,\nDRP, PATH:pc, SEARCH:cr</size>" as UI_CTRL
+    component "EMERGENCY STOP\n<size:10>sends STOP, always enabled</size>" as UI_STOP
+    component "Live grid map\n<size:10>driven by [POS] x,y,h</size>" as UI_MAP
+    component "Sensor bench / console\n<size:10>parses [TURN] [GRAB] [ACK] ...</size>" as UI_LOG
+  }
+  DASH *-- UI_CTRL
+  DASH *-- UI_STOP
+  DASH *-- UI_MAP
+  DASH *-- UI_LOG
+}
+
+actor "IR remote\n<size:10>buttons 1-9, *, OK, #</size>" as IR_REMOTE
+
+'==================== TIER 2: ESP32 ====================
+package "ESP32 (esp32-wifi-bridge/src/main.cpp)" #FFF8F0 {
+  component "WiFi STA\n<size:10>setSleep(false), auto-reconnect</size>" as WIFI
+  component "mDNS\n<size:10>http://mecanumcar.local/</size>" as MDNS
+  component "AsyncWebServer :80\n<size:10>/  /showcase  /engineering  /status</size>" as HTTP
+  component "Gzipped page blobs\n<size:10>showcase_html.h, dashboard_html.h</size>" as BLOBS
+  component "AsyncWebSocket /ws\n<size:10>onWsEvent()</size>" as WS
+  component "pendingCmd queue\n<size:10>captured in callback,\nflushed from loop()</size>" as CMDQ
+  component "lastPosLine cache\n<size:10>retains last [POS],\nreplayed on WS_EVT_CONNECT</size>" as POSCACHE
+  component "unoLineBuf\n<size:10>byte stream -> lines</size>" as LINEBUF
+  component "Serial2 @ 9600\n<size:10>RX2=GPIO16, TX2=GPIO17</size>" as SERIAL2
+}
+
+'==================== TIER 3: UNO FIRMWARE ====================
+package "Arduino Uno (src/FinalSequence.cpp)" #F3FFF3 {
+
+  package "Link layer" #E8FBE8 {
+    component "espSerial\n<size:10>SoftwareSerial RX=11, TX=10 @ 9600</size>" as ESPSER
+    component "Serial (USB)\n<size:10>hardware UART pins 0/1 @ 9600</size>" as USBSER
+    component "Bridge (BridgePrint)\n<size:10>tee: every print -> Serial + espSerial</size>" as BRIDGE
+    component "IRremote\n<size:10>IR_RECEIVE_PIN A3</size>" as IRRX
+  }
+
+  package "Command layer" #E8FBE8 {
+    component "handleSerialCommand()\n<size:10>VERB or VERB:arg, replies [ACK]</size>" as PARSER
+    component "loop() IR dispatch\n<size:10>one code per call</size>" as IRDISP
+    component "checkEmergencyStop()\n<size:10>polled inside EVERY blocking loop;\npeeks both links for 'STOP' + IR '*'</size>" as ESTOP
+    component "emergencyStopActive\n<size:10>single latched flag</size>" as ESTOPFLAG
+  }
+
+  package "Mission layer" #E8FBE8 {
+    component "runPath(path1..3, colour)\n<size:10>Step{Action,arg} arrays:\nFWD LFT RGT GRB REV DRP DLY</size>" as RUNPATH
+    component "searchGrabAndDrop(colour,row)\n<size:10>colour hunt mission</size>" as SEARCH
+    component "moveCoord / turnToHeading\n<size:10>X then Y, ends facing WEST</size>" as COORD
+  }
+
+  package "Motion primitives" #E8FBE8 {
+    component "gridMoveForwardBlocks(n)\n<size:10>per-block slowdown,\nfinal-block crawl</size>" as FWDBLK
+    component "gridMoveForwardOneCoord()\n<size:10>clear junction by sensor state,\nthen seek next</size>" as FWD1
+    component "JunctionDetector\n<size:10>latches each outer sensor\nJUNCTION_LATCH_MS = 120</size>" as JDET
+    component "gridRotateLeft90 / Right90\n<size:10>blind spin -> sensor stop -> brake -> settle</size>" as ROT
+    component "gridSteer(base, boost, left)\n<size:10>outer side +boost, arcs back on line</size>" as STEER
+    component "moveToGrab(colour)\n<size:10>ultrasonic approach ramp\n+ colour-checked grip</size>" as GRAB
+    component "gridStop()" as STOP
+  }
+
+  package "Sensing" #E8FBE8 {
+    component "Line sensors A0/A1/A2\n<size:10>digital, HIGH on line</size>" as LINE
+    component "gridGetDistanceCm()\n<size:10>HC-SR04, TRIG=12 ECHO=13,\npin modes re-asserted per read</size>" as USONIC
+    component "gridDetectColorMajority()\n<size:10>TCS3200 pins 4,5,7,6,8;\naveraged + majority vote</size>" as COLOR
+    component "sensorsEnabled\n<size:10>false while navigating,\ntrue only for approach + grab</size>" as SENSEN
+  }
+
+  package "Actuation" #E8FBE8 {
+    component "gridSetSpeed()\n<size:10>writes globals speed_Upper_L/R,\nspeed_Lower_L/R — raw PWM duty</size>" as SETSPD
+    component "Servo (claw)\n<size:10>pin 9, 0deg open / 100deg closed,\nattach -> sweep -> detach</size>" as SERVO
+  }
+
+  package "State" #E8FBE8 {
+    component "currentX / currentY / currentHeading\n<size:10>home (4,3) WEST</size>" as POSE
+    component "reportPosition()\n<size:10>prints absolute [POS] x,y,h on change\n+ 2s heartbeat from idle loop()</size>" as REPPOS
+  }
+}
+
+'==================== TIER 4: DRIVE ====================
+package "Drive hardware" #FFF0F5 {
+  component "mecanumCar mecCar(3, 2)\n<size:10>lib/MecanumCar_v2 — Advance(),\nTurn_Left/Right(), Stop()</size>" as MECLIB
+  component "Bit-banged I2C\n<size:10>SDA = D3, SCL = D2\nIIC_Start / SendByte / Stop</size>" as I2C
+  component "PWM driver board\n<size:10>Writebyte(reg, duty)\nPWM_OUT ch 1..8</size>" as PWMCHIP
+
+  node "Upper-L motor\n<size:10>ch 3/4</size>" as M_UL
+  node "Lower-L motor\n<size:10>ch 7/8</size>" as M_LL
+  node "Upper-R motor\n<size:10>ch 1/2</size>" as M_UR
+  node "Lower-R motor\n<size:10>ch 5/6</size>" as M_LR
+}
+
+'==================== DOWNSTREAM: COMMANDS ====================
+UI_CTRL --> WS : "<size:10>ws:// text frame\n\"FWD:2\", \"SEARCH:11\"</size>"
+UI_STOP --> WS : "<size:10>\"STOP\"</size>"
+SHOWCASE ..> HTTP : "<size:10>GET /</size>"
+DASH ..> HTTP : "<size:10>GET /engineering</size>"
+HTTP --> BLOBS : "<size:10>beginResponse_P + gzip header</size>"
+WIFI --> HTTP
+MDNS ..> HTTP
+WS --> CMDQ : "<size:10>final unfragmented\ntext frame only</size>"
+CMDQ --> SERIAL2 : "<size:10>flushed from loop(),\nnever off the async task</size>"
+SERIAL2 --> ESPSER : "<size:10>UART 9600, newline-terminated\nUno TX(1)->GPIO16 via divider\nGPIO17->Uno RX(0)</size>"
+
+ESPSER --> PARSER
+USBSER --> PARSER : "<size:10>same parser,\nsame state</size>"
+IR_REMOTE ~~> IRRX : "<size:10>38kHz</size>"
+IRRX --> IRDISP
+
+PARSER --> RUNPATH : "<size:10>PATH:pc</size>"
+PARSER --> SEARCH : "<size:10>SEARCH:cr</size>"
+PARSER --> FWDBLK : "<size:10>FWD:n</size>"
+PARSER --> FWD1 : "<size:10>STEP</size>"
+PARSER --> ROT : "<size:10>LFT / RGT</size>"
+PARSER --> GRAB : "<size:10>GRB:c</size>"
+PARSER --> SERVO : "<size:10>DRP / OPEN</size>"
+PARSER --> ESTOPFLAG : "<size:10>STOP latches / RESUME clears</size>"
+IRDISP --> RUNPATH : "<size:10>buttons 1-9 (path x colour)</size>"
+IRDISP --> GRAB : "<size:10>UP: creep + grab ANY</size>"
+IRDISP --> ESTOPFLAG : "<size:10>'*' latches</size>"
+
+RUNPATH --> FWDBLK
+RUNPATH --> ROT
+RUNPATH --> GRAB
+RUNPATH --> SERVO
+RUNPATH --> SENSEN : "<size:10>on only for last FWD\nbefore GRB, and GRB</size>"
+SEARCH --> COORD
+COORD --> FWD1
+COORD --> ROT
+
+FWDBLK --> JDET
+FWD1 --> JDET
+FWDBLK --> STEER
+FWD1 --> STEER
+GRAB --> STEER : "<size:10>APPROACH_CORRECTION_BOOST</size>"
+GRAB --> USONIC : "<size:10>ramp speed down\n25cm -> grab range</size>"
+GRAB --> COLOR : "<size:10>match target colour\nelse skip grip</size>"
+GRAB --> SERVO : "<size:10>sweep 2deg/15ms, hold 800ms,\ndetach, itemGrabbed = true</size>"
+SENSEN --> USONIC
+SENSEN --> COLOR
+
+LINE --> JDET : "<size:10>L/C/R HIGH latches</size>"
+LINE --> STEER : "<size:10>7 handled patterns</size>"
+
+STEER --> SETSPD
+FWDBLK --> SETSPD
+ROT --> SETSPD
+STOP --> MECLIB
+SETSPD --> MECLIB : "<size:10>4 global duty values\n(no min-throttle map:\n< ~35 PWM stalls)</size>"
+STEER --> MECLIB : "<size:10>Advance()</size>"
+ROT --> MECLIB : "<size:10>Turn_Left() / Turn_Right()</size>"
+MECLIB --> I2C
+I2C --> PWMCHIP : "<size:10>Writebyte(addr, dat)</size>"
+PWMCHIP --> M_UL
+PWMCHIP --> M_LL
+PWMCHIP --> M_UR
+PWMCHIP --> M_LR
+
+'==================== UPSTREAM: TELEMETRY ====================
+FWDBLK ..> POSE : "<size:10>+1 coord per junction</size>"
+ROT ..> POSE : "<size:10>heading</size>"
+POSE ..> REPPOS
+REPPOS ..> BRIDGE : "<size:10>[POS] x,y,h — absolute,\nidempotent, never a delta</size>"
+USONIC ..> BRIDGE : "<size:10>distance / colour telemetry\n(TELEMETRY:1, 250ms)</size>"
+COLOR ..> BRIDGE
+PARSER ..> BRIDGE : "<size:10>[ACK] ...</size>"
+BRIDGE ..> ESPSER
+BRIDGE ..> USBSER
+ESPSER ..> SERIAL2 : "<size:10>UART 9600</size>"
+SERIAL2 ..> LINEBUF : "<size:10>split on '\\n', 240-byte runaway guard</size>"
+LINEBUF ..> POSCACHE : "<size:10>if startsWith(\"[POS]\")</size>"
+LINEBUF ..> WS : "<size:10>ws.textAll(line)</size>"
+POSCACHE ..> WS : "<size:10>replayed to each\nnew client on connect</size>"
+WS ..> UI_MAP
+WS ..> UI_LOG
+
+'==================== E-STOP ====================
+ESTOP --> ESTOPFLAG
+ESTOPFLAG ..> FWDBLK : "<size:10>every blocking loop\nreturns early</size>"
+ESTOPFLAG ..> ROT
+ESTOPFLAG ..> GRAB
+ESTOPFLAG ..> STOP
+
+note right of ESTOP
+  Two independent sources, one flag:
+  1. IR '*' press
+  2. "STOP" peeked off Serial or espSerial
+  Polled *inside* the motion loops, so the
+  dashboard button interrupts a move in
+  progress — not just the next one.
+end note
+
+note bottom of SERIAL2
+  The Uno's single hardware UART is shared by
+  USB and pins 0/1. Never run the USB Serial
+  Monitor and the ESP32 bridge at once.
+end note
+
+note bottom of BLOBS
+  Regenerate after editing dashboard/*.html:
+  python3 esp32-wifi-bridge/tools/gen_dashboard_header.py
+  then reflash the ESP32.
+end note
+
+legend right
+  |<#F4F8FF> Client tier | Browser / IR |
+  |<#FFF8F0> Bridge tier | ESP32 |
+  |<#F3FFF3> Control tier | Uno firmware |
+  |<#FFF0F5> Drive tier | I2C + motors |
+  ---
+  Solid = command path (downstream)
+  Dashed = telemetry / state (upstream)
+endlegend
+
+@enduml
