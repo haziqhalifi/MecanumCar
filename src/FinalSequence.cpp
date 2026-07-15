@@ -78,6 +78,13 @@ bool debugTelemetry = false;
 // (ultrasonic/color); line sensors stay on since navigation needs them.
 // Toggle at runtime with the "ECO"/"ECO:0"/"ECO:1" command. ecoBypass lets the
 // spin helpers keep full, calibrated rotation speed while eco is engaged.
+//
+// STICKY, and the robot has no lamp to show it: once engaged it rewrites every
+// speed on the car until something clears it, and a dashboard reload resets the
+// toggle's LOOK without touching the firmware's state. So the two "put me back
+// to a known state" commands — the remote's OK button and the dashboard's RESET
+// — clear it. Deliberately NOT cleared by resetCoordinates(): runPath() calls
+// that on every scripted run, which would make eco impossible to demo.
 bool ecoMode = false;
 bool ecoBypass = false;
 unsigned long lastTelemetryMillis = 0;
@@ -93,9 +100,12 @@ const unsigned long TELEMETRY_INTERVAL_MS = 1000; // ms between automatic report
 // Deliberately driven from loop() and nowhere else: loop() only runs when the
 // car is idle (a mission blocks it until it finishes), so this never adds serial
 // traffic mid-move. That matters — espSerial is bit-banged SoftwareSerial, whose
-// write() blocks with interrupts DISABLED for ~1ms per byte, which would both
-// stall the line-sensor sampling and stop millis() advancing underneath
-// JunctionDetector. During a move the per-crossing [POS] lines already cover us.
+// write() blocks with interrupts DISABLED for ~1ms per byte, stalling the
+// line-sensor sampling while the car keeps driving. (millis() itself survives:
+// the blackout is ~938us, just under Timer0's 1024us overflow, so no tick is
+// lost. It is the missed SAMPLES that hurt, not the clock.) The forward
+// primitives flush their [POS] once stopped, so a move stays silent throughout;
+// this heartbeat is what resyncs a map whose move aborted before its flush.
 unsigned long lastPosHeartbeatMillis = 0;
 const unsigned long POS_HEARTBEAT_MS = 2000;
 
@@ -146,6 +156,18 @@ void reportPosition() {
 // (moveCoord() still clamps commanded *targets* — that's the guard that keeps
 // the car in bounds. The drop node at X=9 also sits outside GRID_MAX_X=8, so a
 // clamp here would both misreport it and hang `while (currentX < 9)`.)
+// Steps the pose but does NOT report it: this is called from inside the forward
+// primitives' sensor loops, where the car is still under power, and a [POS] line
+// costs ~12 bytes through espSerial at ~1ms per byte of bit-banged, interrupts-
+// disabled SoftwareSerial (see BridgePrint). That is ~12ms of driving per node
+// with no sensor sample taken and no line correction applied — and it lands right
+// at the junction, the one place the car most needs to be steering.
+//
+// The forward primitives therefore flush a single reportPosition() once stopped.
+// [POS] is an ABSOLUTE pose, so one line after the move says exactly what a line
+// per node would have; the map just stops animating mid-move. If a move aborts
+// before its flush (an e-stop bails out early), the loop() heartbeat resyncs the
+// map within POS_HEARTBEAT_MS.
 void advanceTrackedNode() {
     switch (currentHeading) {
         case NORTH: currentY += 1; break;
@@ -153,7 +175,6 @@ void advanceTrackedNode() {
         case EAST:  currentX += 1; break;
         case WEST:  currentX -= 1; break;
     }
-    reportPosition();
 }
 
 void rotateTrackedHeading(bool right) {
@@ -225,11 +246,46 @@ const unsigned long JUNCTION_CLEAR_TIMEOUT_MS = 900;
 // JUNCTION_LATCH_MS is the tuning knob, and it is squeezed from both sides:
 // long enough to span the LEFT-to-RIGHT offset at SPEED_START_FAST, short
 // enough that a line-follow wobble — which trips one outer and then the other
-// as TURN_CORRECTION_BOOST yanks the car back — can never fake a cross. Raise
-// it if crossings are still missed. LOWER it if the car counts phantom nodes on
-// the straights: a phantom count on an outbound leg counts through to column 1
-// and drives the chassis into the block.
-const unsigned long JUNCTION_LATCH_MS = 120;
+// as TURN_CORRECTION_BOOST yanks the car back — can never fake a cross.
+//
+// It was 120ms, and that is catastrophically wide: a weave trips RIGHT, gets
+// yanked back by TURN_CORRECTION_BOOST, and trips LEFT maybe 30-50ms later, so
+// 120ms bridges the two and invents a node. Replaying a modelled FWD 3 carrying
+// one weave per cell counted SEVEN crossings at 120ms and three at 30ms. That is
+// the failure the car actually shows: it stops short, because the count fills up
+// before the wheels arrive, while the tracked pose still reports the target.
+//
+// 30ms is the safe side of a knife edge, and the margin is asymmetric:
+//   * TOO HIGH invents nodes (the bug above) — the move stops early.
+//   * TOO LOW misses them, which is WORSE: the move doesn't shorten, it runs the
+//     car ON down the line hunting a count it already passed.
+// 30ms is defensible because the pre-JunctionDetector firmware required both
+// outers HIGH in the SAME sample — an effective latch of ~0 — and that version
+// worked on this car. So the real offset this must span is near zero, and 30ms
+// already carries an order of magnitude of margin over the only hard evidence
+// there is. The comment above asserts LEFT is mounted ahead of RIGHT, but the
+// gap has never been measured (see lastOuterGapMs).
+//
+// Measure before touching this. Run a straight FWD with CROSSING_TRACE on and
+// read the dump: outerGap is the real offset (set the latch just above the
+// largest), sincePrev is the real cell time (see MIN_CROSSING_INTERVAL_MS).
+const unsigned long JUNCTION_LATCH_MS = 30;
+
+// Physical debounce between two COUNTED crossings: a real cell takes hundreds of
+// ms to traverse, so a second crossing arriving hard on the heels of one is a
+// line-follow weave, not a node. This backs up JUNCTION_LATCH_MS rather than
+// duplicating it — the latch rejects a weave by the GAP between the two outer
+// hits, this rejects one by WHEN it lands relative to the last real node, and
+// the modelled FWD 3 needs both: at a 30ms latch it still counts one phantom
+// without this, and exactly three with it.
+//
+// It only rejects crossings that are physically impossible, so it is safe to
+// raise and cheap to leave in. Tune from a [TRACE] dump rather than by eye: set
+// it comfortably below the SMALLEST sincePrev on a clean run (that is the real
+// cell time) and above the weave period. Too high and it starts eating real
+// crossings, which is the worse failure — the move then runs ON looking for a
+// count it already passed.
+const unsigned long MIN_CROSSING_INTERVAL_MS = 200;
 
 const uint8_t SPEED_ROTATE = 60;
 // Blind-spin duration before we start hunting for the new perpendicular line.
@@ -261,21 +317,16 @@ const unsigned long STEP_TRANSITION_MS = 250;
 // the centre sensor on the line, so a sustained all-LOW only happens off-track.
 // Tune: raise if the car false-stops crossing wide gaps, lower to halt sooner.
 const unsigned long LINE_LOST_TIMEOUT_MS = 800;
-// Start speed for the scripted-path block approach. Kept below SPEED_MIN so the
-// approach creeps in noticeably slower and still tapers toward APPROACH_SPEED_FLOOR.
-// Lowered from 42: at the higher speed the car noses onto the block before its
-// line-follow correction has straightened it, so it arrives slightly skewed and
-// the claw can't grip. A slower approach gives the alignment time to settle.
-// Must stay strictly below SPEED_MIN (38) so executeApproachMovement's taper
-// engages (it only ramps toward APPROACH_SPEED_FLOOR when startSpeed < SPEED_MIN;
-// at exactly SPEED_MIN the floor becomes SPEED_MIN and the approach runs flat).
-// Lowered further from 37 to 35 (one notch above APPROACH_SPEED_FLOOR=34) so the
-// WHOLE approach — not just the final taper — is a slow crawl, giving the
-// line-follow correction the maximum distance to straighten the car onto the line
-// before it reaches the block and grabs. Do NOT go below ~34: that is near the
-// motors' stall/breakaway floor (see APPROACH_SPEED_FLOOR note) and the car would
-// buzz in place and stop short of the block instead of creeping onto it.
-const uint8_t PATH_APPROACH_SPEED = 35;
+// Start speed for the scripted-path block approach, and the ceiling of
+// executeApproachMovement's taper (which ramps from here down to floorSpeed as
+// the block nears). Sitting above SPEED_MIN makes that floor SPEED_MIN, giving
+// the approach a real 42 -> 38 taper.
+//
+// Bounded from below by the motors, not by the geometry: this value is raw PWM
+// duty (see APPROACH_SPEED_FLOOR), and anything near ~35 is at breakaway torque —
+// the car buzzes in place instead of creeping and stalls short of the block, so
+// the claw closes on nothing. Slower is NOT safer here.
+const uint8_t PATH_APPROACH_SPEED = 42;
 const int ITEM_DETECT_DISTANCE_CM = 25;
 // Stop this far from the block to read colour and grab — leave a GAP rather than
 // nosing right up to it. The gripper jaws swing FORWARD as they close, so they
@@ -287,23 +338,27 @@ const int ITEM_DETECT_DISTANCE_CM = 25;
 // block reliably. Do NOT go to 6cm — that is the measured collision point where
 // the chassis rams the block, leaving no margin for ultrasonic jitter.
 const int GRAB_APPROACH_DISTANCE_CM = 7;
-// Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
-// still used by the scripted paths' floor). Lets a caller start slower than
-// SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
-// further as it nears the grab distance.
-// NOTE: the speed value is sent straight through as raw PWM duty cycle to the
-// I2C motor driver (see mecanumCar::PWM_OUT / Writebyte) — there's no minimum
-// throttle mapping. 10/255 (~4%) is below the motors' stall/breakaway torque,
-// so the car just buzzed in place instead of creeping — that's why lowering
-// this earlier caused it to stop short of the block. Keep this close to
-// SPEED_MIN so it still physically moves; it only needs to be slightly below
-// SPEED_MIN to give a *visible* taper, not a true crawl.
-// Lowered from 38 to 34 so the very last stretch onto the block is a genuine
-// crawl — this is where the car needs to be dead-straight for the claw to grip.
-// 34 is close to the stall floor (~35 crawl elsewhere) so it still creeps but is
-// slow enough that any residual line-follow correction can straighten it before
-// it reaches the grab distance and stops.
-const uint8_t APPROACH_SPEED_FLOOR = 34;
+// Absolute floor for the approach ramp-down, and only consulted for a caller
+// that starts BELOW SPEED_MIN (executeApproachMovement picks SPEED_MIN as the
+// floor otherwise). At the current call sites — 42 from the paths, 40 from the
+// UP button, SPEED_MIN by default — nothing starts below SPEED_MIN, so this is
+// inert; it exists to keep a deliberately slow caller from tapering into a stall.
+//
+// The speed value is raw PWM duty straight through to the I2C motor driver (see
+// mecanumCar::PWM_OUT / Writebyte) — there is no minimum-throttle mapping, so a
+// number that looks like a gentle crawl is simply below breakaway torque and the
+// car does not move at all. Keep this at or just under SPEED_MIN.
+const uint8_t APPROACH_SPEED_FLOOR = 38;
+// Slowest speed Eco-Mode is allowed to command. Separate from
+// APPROACH_SPEED_FLOOR on purpose: ecoSpeed() used to borrow that constant, so
+// retuning the block approach silently retuned every eco-mode speed on the car —
+// two unrelated knobs welded together.
+//
+// 35 rather than a smaller "really slow" number because this is a raw PWM duty
+// (see APPROACH_SPEED_FLOOR) and below breakaway the car buzzes instead of
+// moving. 35 is known to move it: FINAL_BLOCK_CRAWL_SPEED is 35 and every
+// forward move already ends on it.
+const uint8_t ECO_SPEED_FLOOR = 35;
 const uint8_t CLAW_OPEN_ANGLE = 0;         // wider default-open (lower angle = more open)
 const uint8_t CLAW_CLOSED_ANGLE = 100;
 // pulseIn timeout for one color-sensor channel read (microseconds).
@@ -354,14 +409,22 @@ void motionTelemetryTick(unsigned long &lastTelemetryMillis) {
 }
 
 
-// Eco-Mode slowdown: ~30% off, floored at APPROACH_SPEED_FLOOR so the motors
-// still physically move (below ~34 they stall). Returns the speed unchanged
-// when eco is off. Rotations pass through gridSetSpeed with ecoBypass set, so
-// timed 90 turns keep their calibrated SPEED_ROTATE.
+// Eco-Mode slowdown: ~30% off, floored at ECO_SPEED_FLOOR so the motors still
+// physically move. Returns the speed unchanged when eco is off. Rotations pass
+// through gridSetSpeed with ecoBypass set, so timed 90 turns keep their
+// calibrated SPEED_ROTATE.
+//
+// The floor makes this a clamp, not a scale — every speed whose 70% lands under
+// it comes out AT it. That is fine going down, but it used to mean eco handed
+// back a number HIGHER than it was given: FINAL_BLOCK_CRAWL_SPEED is 35, and
+// with the old floor of 38 the eco'd "slow" crawl onto the final junction ran
+// faster than the normal one. Eco must only ever slow the car, so clamp to the
+// requested speed on the way out.
 uint8_t ecoSpeed(uint8_t s) {
     if (!ecoMode) return s;
     int reduced = (int)s * 7 / 10;
-    if (reduced < APPROACH_SPEED_FLOOR) reduced = APPROACH_SPEED_FLOOR;
+    if (reduced < ECO_SPEED_FLOOR) reduced = ECO_SPEED_FLOOR;
+    if (reduced > (int)s) reduced = s;
     return (uint8_t)reduced;
 }
 
@@ -529,11 +592,17 @@ struct JunctionDetector {
     // which we have so far only guessed at. Recorded by the crossing trace.
     long lastOuterGapMs;
 
+    // Time of the last crossing this detector actually COUNTED, for the
+    // MIN_CROSSING_INTERVAL_MS debounce. Seeded at construction: every call site
+    // builds the detector either parked on a node or having just cleared one, so
+    // "now" is the right zero point for the first cell either way.
+    unsigned long lastCountedAt;
+
     // startOnJunction: true when the move begins with the car parked ON a node,
     // so the cross already under the wheels isn't counted as a fresh crossing.
     JunctionDetector(bool startOnJunction)
         : leftSeenAt(0), rightSeenAt(0), latched(startOnJunction),
-          lastOuterGapMs(0) {}
+          lastOuterGapMs(0), lastCountedAt(millis()) {}
 
     // Feed one sensor sample. Returns true exactly once per crossing, on the
     // sample that completes it.
@@ -546,12 +615,20 @@ struct JunctionDetector {
                        (now - leftSeenAt) < JUNCTION_LATCH_MS &&
                        (now - rightSeenAt) < JUNCTION_LATCH_MS;
         // Not on a cross — re-arm for the next one. Note the latches outlive the
-        // sensors by JUNCTION_LATCH_MS, so this also debounces the roll-off.
+        // sensors by JUNCTION_LATCH_MS, so this also debounces the roll-off, and
+        // that expiry is the ONLY thing allowed to re-arm us: the timestamps must
+        // not be cleared on a count. Clearing them lets a single chattering outer
+        // sample drop onCross (it tests != 0) while the car is still physically on
+        // the cross, which re-arms mid-junction and counts the same node twice.
         if (!onCross) { latched = false; return false; }
         if (latched) return false;       // still the crossing we already counted
+        // Latch either way: this cross is handled now, whether or not it counts.
+        // Without this a rejected weave stays unlatched and simply counts once
+        // MIN_CROSSING_INTERVAL_MS elapses while it is still oscillating.
         latched = true;
+        if (now - lastCountedAt < MIN_CROSSING_INTERVAL_MS) return false;  // weave
+        lastCountedAt = now;
         lastOuterGapMs = (long)leftSeenAt - (long)rightSeenAt;
-        leftSeenAt = rightSeenAt = 0;    // spent: this cross can't count twice
         return true;
     }
 };
@@ -563,10 +640,9 @@ struct JunctionDetector {
 // Recorded into RAM and dumped only once the car has STOPPED, because printing
 // from inside the move would destroy the measurement: espSerial is bit-banged
 // SoftwareSerial whose write() blocks with interrupts disabled ~1ms/byte, so a
-// log line mid-move stalls the sensor sampling and millis() alike — the very
-// signals being measured. (The per-crossing [POS] line already pays that cost;
-// see POS_HEARTBEAT_MS. That's a real overshoot source, but it lands after the
-// count, so it can't hide a crossing.)
+// log line mid-move stalls the sensor sampling — the very signal being measured.
+// Nothing else prints during a forward move either (see advanceTrackedNode), so
+// these numbers are the loop's real timing rather than the serial port's.
 //
 // Read the dump like this:
 //   * sincePrev — ms between consecutive COUNTED crossings. On an even run
@@ -737,7 +813,8 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
         while(millis() - offsetStart < CENTER_OFFSET_MS) { if (checkEmergencyStop()) return; }
     }
     gridStop();
-    crossingTraceDump();   // car is stopped — safe to spend serial time now
+    reportPosition();      // car is stopped — safe to spend serial time now
+    crossingTraceDump();
 }
 
 void gridMoveForwardOneCoord(uint8_t startSpeed) {
@@ -800,7 +877,7 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
     // The junction is reached the moment the loop above breaks, so bank the pose
     // here rather than after the center-offset nudge below — that block can
     // return early on a stop, which would otherwise lose a node the car really
-    // did travel.
+    // did travel. Only the pose is banked; the [POS] line waits for the stop.
     advanceTrackedNode();
 
     if (CENTER_OFFSET_MS > 0 && !emergencyStopActive) {
@@ -810,6 +887,7 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
         while(millis() - offsetStart < CENTER_OFFSET_MS) { if (checkEmergencyStop()) return; }
     }
     gridStop();
+    reportPosition();
 }
 
 int gridGetDistanceCm() {
@@ -1559,6 +1637,12 @@ void runPath(const Step* path, int len, int targetColour) {
     // before a GRB) and the GRB itself.
     sensorsEnabled = false;
     openClawWithAttach();   // ensure the gripper starts open before any sequence runs
+    // A scripted path is dead-reckoned from home and never reads the tracked
+    // pose — the steps below only count junctions. But they do WRITE the pose
+    // (via the primitives), so without this the dashboard map would still be
+    // sitting on the drop node from the previous run and drift a little further
+    // every press. searchGrabAndDrop() reset here too; keep parity.
+    resetCoordinates();
     for (int i = 0; i < len; i++) {
         if (emergencyStopActive) break;
         switch(path[i].act) {
@@ -1691,9 +1775,11 @@ void handleSerialCommand() {
         else if (p == 2) runPath(path2, sizeof(path2)/sizeof(Step), c);
         else if (p == 3) runPath(path3, sizeof(path3)/sizeof(Step), c);
     } else if (verb == "SEARCH") {               // arg encodes color*10 + startRow
-        // Mirrors the 9 IR-remote mission buttons: searchGrabAndDrop(color, row)
-        // with color 0=RED 1=BLUE 2=YELLOW and startRow 1/3/5 — so the dashboard
-        // can debug the exact routine each remote button runs.
+        // The ONLY way to reach searchGrabAndDrop(): colour 0=RED 1=BLUE 2=YELLOW,
+        // startRow 1/3/5. The remote's mission buttons run the scripted paths
+        // instead (see loop()), so this is where the search routine gets debugged
+        // — deliberately off the remote until it has earned its way back.
+        // The dashboard's PATH:<path><colour> above runs what the buttons run.
         int c = arg / 10, r = arg % 10;
         if (!(r == 1 || r == 3 || r == 5)) r = 1;
         if (c < RED || c > YELLOW) c = RED;
@@ -1702,7 +1788,8 @@ void handleSerialCommand() {
         searchGrabAndDrop(c, r);
     } else if (verb == "RESET") {
         resetCoordinates();
-        Bridge.println(F("[ACK] RESET coordinates"));
+        ecoMode = false;   // "known state" includes full speed — see ecoMode
+        Bridge.println(F("[ACK] RESET coordinates, eco off"));
     } else if (verb == "ECO") {
         // Simulate the solar-power FSM transition: a cloud drops solar input, so
         // the harvester drops into Eco-Mode (slower, non-essential sensors off).
@@ -1804,20 +1891,35 @@ void loop() {
             emergencyStopActive = false; 
 
             switch (key) {
-                // Each button starts the colour search at its associated block
-                // (path1->row1, path2->row3, path3->row5), then hops to the
-                // other blocks nearest-first until the target colour is found.
-                case 22: searchGrabAndDrop(RED, 1); break; // button 1
-                case 25: searchGrabAndDrop(RED, 3); break; // button 2
-                case 13: searchGrabAndDrop(RED, 5); break; // button 3
+                // Nine mission buttons — colour × block row, one per key:
+                //     1(22)  2(25)  3(13)   RED    × row 1 / 3 / 5
+                //     4(12)  5(24)  6(94)   BLUE   × row 1 / 3 / 5
+                //     7(8)   8(28)  9(90)   YELLOW × row 1 / 3 / 5
+                // path1->row1, path2->row3, path3->row5; each grips only on a
+                // colour match. The codes look unordered because they are raw NEC
+                // commands off the 21-key mini remote, not key numbers — read the
+                // bracketed digit, not the case value. (The labels here said
+                // "button 1/2/3" three times over, which is why this looked like
+                // three buttons rather than nine.)
+                //
+                // These ran searchGrabAndDrop() — a coordinate-driven search that
+                // hops between blocks — from d77b94d until now. That routine is
+                // still reachable from the dashboard as SEARCH:<colour><row> and
+                // is worth debugging there, but it went onto the remote in the
+                // same commit that added the ESP32 bridge, untested, and replaced
+                // the paths that were actually tuned against the mat. The remote
+                // is the primary control surface; it runs the proven engine.
+                case 22: runPath(path1, sizeof(path1)/sizeof(Step), RED); break;    // key 1
+                case 25: runPath(path2, sizeof(path2)/sizeof(Step), RED); break;    // key 2
+                case 13: runPath(path3, sizeof(path3)/sizeof(Step), RED); break;    // key 3
 
-                case 12: searchGrabAndDrop(BLUE, 1); break; // button 1
-                case 24: searchGrabAndDrop(BLUE, 3); break; // button 2
-                case 94: searchGrabAndDrop(BLUE, 5); break; // button 3
+                case 12: runPath(path1, sizeof(path1)/sizeof(Step), BLUE); break;   // key 4
+                case 24: runPath(path2, sizeof(path2)/sizeof(Step), BLUE); break;   // key 5
+                case 94: runPath(path3, sizeof(path3)/sizeof(Step), BLUE); break;   // key 6
 
-                case 8:  searchGrabAndDrop(YELLOW, 1); break; // button 1
-                case 28: searchGrabAndDrop(YELLOW, 3); break; // button 2
-                case 90: searchGrabAndDrop(YELLOW, 5); break; // button 3
+                case 8:  runPath(path1, sizeof(path1)/sizeof(Step), YELLOW); break; // key 7
+                case 28: runPath(path2, sizeof(path2)/sizeof(Step), YELLOW); break; // key 8
+                case 90: runPath(path3, sizeof(path3)/sizeof(Step), YELLOW); break; // key 9
 
                 // case 12: executeAutoMission(1, BLUE); break;              // button 4
                 // case 24: executeAutoMission(3, BLUE); break;              // button 5
@@ -1825,18 +1927,19 @@ void loop() {
                 // case 8: executeAutoMission(1, YELLOW); break;               // button 4
                 // case 28: executeAutoMission(3, YELLOW); break;              // button 5
                 // case 90: executeAutoMission(5, YELLOW); break;              // button 6
-                case 74: openClawWithAttach(); break; // button #
+                case 74: openClawWithAttach(); break; // key # — open the claw
                 case 70: // button UP — creep forward at 40, slowing further on approach, grip on contact
                     sensorsEnabled = true;
                     moveToGrab(ANY, 40);
                     break;
-                case 67: clawNudge(false); break; // button RIGHT — nudge claw toward OPEN
-                case 68: clawNudge(true);  break; // button LEFT  — nudge claw toward CLOSED
-                case 64: // button OK — full reset: open grip, clear nav state, re-enable sensors
+                case 67: clawNudge(false); break; // key RIGHT — nudge claw toward OPEN
+                case 68: clawNudge(true);  break; // key LEFT  — nudge claw toward CLOSED
+                case 64: // button OK — full reset: grip open, nav clear, sensors on, eco off
                     openClawWithAttach();
                     resetCoordinates();
                     sensorsEnabled = true;
-                    Bridge.println(F("[SYSTEM] OK pressed — reset complete."));
+                    ecoMode = false;   // see ecoMode: sticky, and nothing else shows it
+                    Bridge.println(F("[SYSTEM] OK pressed — reset complete, eco off."));
                     break;
                 default: break;
             }
