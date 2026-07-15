@@ -351,13 +351,19 @@ const char *gridColorName(int color);
 void turnToHeading(int targetHeading);
 bool checkEmergencyStop();
 
+// Pass as `color` to print a distance-only telemetry line. Distinct from the
+// RED/BLUE/YELLOW values and from the "no match" fallback, so a line that
+// skipped the colour read never reads as an actual classification.
+const int COLOR_NOT_READ = -99;
+
 void printStatusTelemetry(int distance, int color) {
     if (emergencyStopActive) return;
     Bridge.print(F("distance: "));
     if (distance == -1) Bridge.print(F("---"));
     else Bridge.print(distance);
     Bridge.print(F("cm | color: "));
-    Bridge.println(gridColorName(color));
+    if (color == COLOR_NOT_READ) Bridge.println(F("---"));
+    else Bridge.println(gridColorName(color));
 }
 
 // Read sensors and print a single consolidated telemetry line without
@@ -1165,7 +1171,6 @@ bool isGrabTargetReached(int currentDistance) {
 // instead of driving forward off the grid, and let the caller search elsewhere.
 bool executeApproachMovement(int currentDistance, uint8_t startSpeed) {
     if (emergencyStopActive) return false;
-    unsigned long telemetryTickMillis = millis();
     uint8_t floorSpeed = (startSpeed < SPEED_MIN) ? min(APPROACH_SPEED_FLOOR, startSpeed) : SPEED_MIN;
     // Running commanded speed, slewed toward the distance-derived target each tick
     // so the car glides in instead of stuttering on ultrasonic jitter. Seeded at
@@ -1179,13 +1184,13 @@ bool executeApproachMovement(int currentDistance, uint8_t startSpeed) {
         // 9 blocking pulseIn calls (up to ~0.3s of *variable* stall) and the
         // approach only needs distance — reading it every tick made the loop
         // period lurch and the motors stutter. Colour is decided later in
-        // grabColorIfMatch; here we only sample it for the telemetry line when
-        // debug output is actually on.
+        // grabColorIfMatch, so the telemetry line reports distance only and the
+        // tick period stays flat whether or not debug output is on.
         int distance = gridGetDistanceCm();
         currentDistance = distance;
         if (debugTelemetry) {
             Bridge.print(F("[APPROACH] "));
-            printStatusTelemetry(distance, gridDetectColorValue());
+            printStatusTelemetry(distance, COLOR_NOT_READ);
         }
 
         // Boundary guard: the block is always at column 1. If the car has crept
@@ -1240,7 +1245,6 @@ bool executeApproachMovement(int currentDistance, uint8_t startSpeed) {
             mecCar.Advance();
         }
         delay(APPROACH_TICK_MS);
-        motionTelemetryTick(telemetryTickMillis);
     }
     gridStop();
     return true;   // exited the loop because a block is within grab range
