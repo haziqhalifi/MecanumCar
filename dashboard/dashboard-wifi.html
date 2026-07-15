@@ -602,7 +602,7 @@
         <svg id="mapSvg" viewBox="0 0 326 202" role="img" aria-label="grid map with robot position"></svg>
       </div>
       <div class="stat-row" style="border:0; padding:0;"><span class="k">pose (x, y · heading)</span><span class="v" id="poseVal">7, 3 · WEST</span></div>
-      <div class="ctl-note">6×6 collecting grid · 3×2 START zone (home 7,3) · drop area next to it. Red band = no-go perimeter (car stays one line in from every edge). Driven by firmware <b>[POS]</b> lines — updates on coordinate-tracked moves (SEARCH missions, Reset coords); scripted paths 1–3 don't report position</div>
+      <div class="ctl-note">6×6 collecting grid · 3×2 START zone (home 7,3) · drop area next to it. Red band = no-go perimeter (car stays one line in from every edge). Driven by firmware <b>[POS]</b> lines — the pose is tracked inside the motion primitives, so every move reports: SEARCH missions, scripted paths 1–3, and the manual FWD/STEP/LFT/RGT buttons alike</div>
     </section>
 
     <!-- Sensor test bench (single source for distance / color / IR) -->

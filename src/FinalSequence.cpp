@@ -115,6 +115,36 @@ void reportPosition() {
     Bridge.println(currentHeading);
 }
 
+// ── Tracked-pose updates (single source of truth) ───────────────────────────
+// These live INSIDE the motion primitives (gridMoveForwardOneCoord,
+// gridMoveForwardBlocks, gridRotate*90) rather than in their callers. They used
+// to be done by hand in moveCoord()/turnToHeading() *after* calling a
+// primitive, which meant any code path that called a primitive directly — every
+// dashboard button (FWD/STEP/LFT/RGT) and every scripted path (runPath) — moved
+// the real car while the tracked pose sat still. The map then disagreed with the
+// robot until the next resetCoordinates(). Tracking at the primitive means the
+// pose follows the wheels no matter who asked them to turn.
+//
+// Deliberately NOT clamped to the grid bounds: this is a report of where the car
+// actually is, so it must be free to say "off the grid" rather than quietly lie.
+// (moveCoord() still clamps commanded *targets* — that's the guard that keeps
+// the car in bounds. The drop node at X=9 also sits outside GRID_MAX_X=8, so a
+// clamp here would both misreport it and hang `while (currentX < 9)`.)
+void advanceTrackedNode() {
+    switch (currentHeading) {
+        case NORTH: currentY += 1; break;
+        case SOUTH: currentY -= 1; break;
+        case EAST:  currentX += 1; break;
+        case WEST:  currentX -= 1; break;
+    }
+    reportPosition();
+}
+
+void rotateTrackedHeading(bool right) {
+    currentHeading = right ? (currentHeading + 1) % 4 : (currentHeading + 3) % 4;
+    reportPosition();
+}
+
 
 // ── Tuning Constants ───────────────────────────────────────────────────────
 const uint8_t SPEED_START_FAST = 48;
@@ -136,6 +166,24 @@ const uint8_t TURN_CORRECTION_BOOST = 50;
 // it roughly straight toward the block instead of aggressively arcing.
 const uint8_t APPROACH_CORRECTION_BOOST = 12;
 const unsigned long CENTER_OFFSET_MS = 110;
+
+// ── Junction-clearing (line-width independent) ──────────────────────────────
+// Leaving a junction used to be a blind fixed 140ms drive, after which the code
+// assumed the junction was behind it and any all-sensors-HIGH read must be the
+// NEXT junction. That assumption is only as good as the line width it was tuned
+// against: on a WIDER/BOLDER line (the drop node at 9,3 is painted heavier than
+// the rest of the grid) the car is still standing on the same line when the
+// timer expires, so the hunt loop instantly "finds" the line it never left and
+// counts a node it never travelled. Every count downstream is then off by one.
+//
+// Instead, clear the junction by STATE: drive until the sensors actually stop
+// reading the junction (center goes LOW = we're on plain line//mat again), so a
+// fat line just takes a few more ms rather than corrupting the count.
+// JUNCTION_CLEAR_MIN_MS debounces the sensor as it rolls off the line;
+// JUNCTION_CLEAR_TIMEOUT_MS is a backstop so a stuck-HIGH sensor can't hang the
+// move forever (it falls through to the old time-based behaviour).
+const unsigned long JUNCTION_CLEAR_MIN_MS = 60;
+const unsigned long JUNCTION_CLEAR_TIMEOUT_MS = 900;
 const uint8_t SPEED_ROTATE = 60;
 // Blind-spin duration before we start hunting for the new perpendicular line.
 // Must be long enough to rotate PAST the too-early black detection (car stops
@@ -187,9 +235,11 @@ const int ITEM_DETECT_DISTANCE_CM = 25;
 // reach the block from this standoff; stopping closer makes the chassis collide
 // with the block (and the colour read is taken here too, so it must not ram it).
 // Empirical — tune on the real car: too large and the closing claw misses the
-// block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm.
-// Lowered to 8cm so the car noses slightly closer to the block before gripping.
-const int GRAB_APPROACH_DISTANCE_CM = 8;
+// block, too small and the chassis bumps it. Was 6cm (nose-to-block), then 9cm,
+// then 8cm. Now 7cm: measured as the distance where the colour sensor reads the
+// block reliably. Do NOT go to 6cm — that is the measured collision point where
+// the chassis rams the block, leaving no margin for ultrasonic jitter.
+const int GRAB_APPROACH_DISTANCE_CM = 7;
 // Absolute floor for the approach ramp-down, separate from SPEED_MIN (which is
 // still used by the scripted paths' floor). Lets a caller start slower than
 // SPEED_MIN (e.g. the UP button's 40) and still have room to taper down
@@ -309,21 +359,60 @@ void disableSensors() {
     Bridge.println(F("[SYSTEM] Ultrasonic and Color sensors have been SOFTWARE DISABLED."));
 }
 
-// Peek at either serial link for a dashboard STOP without consuming a full
-// command line. Called from inside long-running motion loops so a STOP sent
-// while the car is mid-move (dashboard or wired) aborts immediately, just like
-// the IR remote — instead of waiting for the whole move to finish. We look at
-// the first byte only ('S'): the ESP32 forwards "STOP\n" verbatim, and no other
-// command the dashboard sends starts with 'S' except SENSORS, which is refused
-// while latched anyway. On a match we drain the rest of the line so it doesn't
-// linger in the buffer.
-bool serialStopRequested(Stream &link) {
-    if (!link.available()) return false;
-    if (link.peek() != 'S' && link.peek() != 's') return false;
-    String line = link.readStringUntil('\n');
-    line.trim();
-    line.toUpperCase();
-    return line == "STOP";
+// ── Non-blocking serial line reader ─────────────────────────────────────────
+// Both the mid-move stop check and the idle command handler pull lines through
+// here. Bytes are accumulated into a per-link buffer and a line is only
+// returned once its terminating newline actually arrives, so we NEVER block
+// waiting on the wire. This matters twice over:
+//
+//   * readStringUntil() blocks for its 1s timeout when the newline hasn't
+//     landed yet. Calling that from inside a motion loop stalls the loop (and
+//     the motors keep running) for up to a second per call.
+//   * A byte-sniffing peek that bails on a non-match leaves those bytes in the
+//     buffer forever. A STOP queued behind any other command would then sit
+//     unread and never fire — the exact case where E-STOP must not fail.
+//
+// Returns true and fills `out` (trimmed, upper-cased) on a complete line.
+struct LineReader {
+    String buf;
+    bool poll(Stream &link, String &out) {
+        while (link.available()) {
+            char c = (char)link.read();
+            if (c == '\n') {
+                out = buf;
+                buf = "";
+                out.trim();
+                out.toUpperCase();
+                if (out.length()) return true;
+            } else if (c != '\r') {
+                if (buf.length() < 64) buf += c;   // guard a runaway line
+            }
+        }
+        return false;
+    }
+};
+
+// One buffer per link. Both the idle path (handleSerialCommand) and the
+// mid-move path (checkEmergencyStop) share these, so a partial line read
+// during a move is completed by the next poll rather than being lost.
+LineReader usbReader, espReader;
+
+// A command that arrived while the car was mid-move but ISN'T a stop. We can't
+// run it from inside the motion loop, so it's stashed here and picked up by
+// handleSerialCommand() once the move returns — otherwise the mid-move poll
+// would silently eat every non-STOP command the dashboard sent.
+String deferredCmd = "";
+
+// Poll both links for a STOP while a move is in progress. Non-STOP lines are
+// deferred (see above) rather than dropped.
+bool serialStopRequested() {
+    String line;
+    bool stop = false;
+    if (usbReader.poll(Serial, line) || espReader.poll(espSerial, line)) {
+        if (line == "STOP") stop = true;
+        else deferredCmd = line;
+    }
+    return stop;
 }
 
 bool checkEmergencyStop() {
@@ -338,13 +427,26 @@ bool checkEmergencyStop() {
         IrReceiver.resume();
     }
     // Dashboard / wired STOP mid-move: abort just as hard as the IR remote.
-    if (serialStopRequested(Serial) || serialStopRequested(espSerial)) {
+    if (serialStopRequested()) {
         emergencyStopActive = true;
         gridStop();
         Bridge.println(F("\n!!! EMERGENCY STOP TRIGGERED (dashboard) !!!"));
         return true;
     }
     return emergencyStopActive;
+}
+
+// A drop-in replacement for delay() that stays responsive to an emergency stop.
+// Plain delay() is the enemy of a working E-STOP: every ms spent inside it is a
+// ms where a STOP sits unread and the motors keep doing whatever they were
+// doing. Use this anywhere a blocking wait is long enough to notice (>~50ms).
+// Returns true if a stop fired during the wait, so callers can bail out.
+bool interruptibleDelay(unsigned long ms) {
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        if (checkEmergencyStop()) return true;
+    }
+    return false;
 }
 
 // Safety: detect the car running off the grid. Past the outermost grid line
@@ -384,14 +486,15 @@ bool gridRotateLeft90() {
         if (digitalRead(LINE_CENTER_PIN) == HIGH) break;
     }
     spinRightInPlace(SPEED_ROTATE + 10);
-    
+
     unsigned long brakeStart = millis();
     while (millis() - brakeStart < BRAKE_MS) { if (checkEmergencyStop()) return false; }
     mecCar.Stop();
-    
+
     unsigned long settleStart = millis();
 
     while (millis() - settleStart < TURN_SETTLE_MS) { if (checkEmergencyStop()) return false; }
+    rotateTrackedHeading(false);   // completed a left 90 — pose follows the wheels
     return true;
 }
 
@@ -410,13 +513,14 @@ bool gridRotateRight90() {
         if (digitalRead(LINE_RIGHT_PIN) == HIGH) break;
     }
     spinLeftInPlace(SPEED_ROTATE + 10);
-    
+
     unsigned long brakeStart = millis();
     while (millis() - brakeStart < BRAKE_MS) { if (checkEmergencyStop()) return false; }
     mecCar.Stop();
-    
+
     unsigned long settleStart = millis();
     while (millis() - settleStart < TURN_SETTLE_MS) { if (checkEmergencyStop()) return false; }
+    rotateTrackedHeading(true);    // completed a right 90 — pose follows the wheels
     return true;
 }
 
@@ -446,6 +550,7 @@ void gridMoveForwardBlocks(int targetBlocks, uint8_t startSpeed) {
             if (!onJunction) {
                 junctionCount++;
                 onJunction = true;
+                advanceTrackedNode();   // crossed a junction — pose moves one node
                 if (junctionCount == targetBlocks) break;
             }
             gridSetSpeed(currentSpeed);
@@ -480,12 +585,28 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
     if (checkEmergencyStop()) return;
     unsigned long telemetryTickMillis = millis();
     unsigned long lineLostSince = 0;
+    // Phase 1 — clear the junction we're standing on. Drive until the sensors
+    // confirm it's behind us (a junction reads L+R HIGH together; plain line
+    // does not), NOT for a fixed time. This is what makes the move immune to
+    // line width: a wide/bold junction simply takes longer to roll off.
     unsigned long leaveTime = millis();
-    while (millis() - leaveTime < 140) {
+    while (true) {
         if (checkEmergencyStop()) return;
         uint8_t Left = digitalRead(LINE_LEFT_PIN);
         uint8_t Center = digitalRead(LINE_CENTER_PIN);
         uint8_t Right = digitalRead(LINE_RIGHT_PIN);
+
+        unsigned long elapsed = millis() - leaveTime;
+        // Both outer sensors off the cross = the junction is genuinely behind
+        // us. Debounced by a minimum time so sensor chatter on the way off the
+        // line doesn't end this phase a few mm in.
+        bool cleared = (Left == LOW && Right == LOW);
+        if (elapsed >= JUNCTION_CLEAR_MIN_MS && cleared) break;
+        if (elapsed >= JUNCTION_CLEAR_TIMEOUT_MS) {
+            Bridge.println(F("[TRACK] Junction clear timed out — sensor stuck HIGH?"));
+            break;
+        }
+
         if (Left == LOW && Center == HIGH && Right == LOW) { gridSetSpeed(startSpeed); mecCar.Advance(); }
         else if (Right == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, false);
         else if (Left == HIGH) gridSteer(startSpeed, TURN_CORRECTION_BOOST, true);
@@ -512,6 +633,12 @@ void gridMoveForwardOneCoord(uint8_t startSpeed) {
 
         motionTelemetryTick(telemetryTickMillis);
     }
+
+    // The junction is reached the moment the loop above breaks, so bank the pose
+    // here rather than after the center-offset nudge below — that block can
+    // return early on a stop, which would otherwise lose a node the car really
+    // did travel.
+    advanceTrackedNode();
 
     if (CENTER_OFFSET_MS > 0 && !emergencyStopActive) {
         gridSetSpeed(SPEED_MIN);
@@ -635,13 +762,19 @@ const char *gridColorName(int color) {
     return "ANY / OTHERS";
 }
 
+// NOTE: deliberately has no emergencyStopActive guard. Releasing the gripper is
+// always safe and is the natural recovery after a stop that latched mid-grab —
+// refusing to run it while stopped would strand a block in a clamped claw.
 void openClawWithAttach() {
-    if (emergencyStopActive) return;
     clawServo.attach(CLAW_SERVO_PIN);
     // Re-send the open angle a few times with settle pauses in between. If the
     // claw was gripping an object under stall current, a single write can be
     // dropped by a momentary brownout — repeating it gives the servo more
     // chances to actually reach the open position before we detach.
+    // Not interruptible on purpose: opening the claw is a SAFE, recovery action
+    // (it releases whatever is held). Aborting it on a latched stop would leave
+    // the gripper clamped shut with no way to open it. It's ~1.2s of servo
+    // settle, and the motors are already halted whenever a stop is latched.
     for (int i = 0; i < 3; i++) {
         clawServo.write(CLAW_OPEN_ANGLE);
         delay(400);
@@ -684,17 +817,22 @@ void gridSlightReverse() {
 // Slow-sweep close of the claw and latch the grabbed state. Shared by the
 // path-driven grabColor() and the idle auto-grab in loop().
 void closeClawGrip() {
-    delay(GRAB_SETTLE_MS); // let the car come to a full stop before gripping
+    if (interruptibleDelay(GRAB_SETTLE_MS)) return;  // full stop before gripping
 
     clawServo.attach(CLAW_SERVO_PIN);
 
-    // SLOW SWEEP: Gradually close the claw instead of snapping it
+    // SLOW SWEEP: Gradually close the claw instead of snapping it. The sweep is
+    // ~2.5s of blocking delay, so it polls for a stop between steps: an E-STOP
+    // pressed mid-grab must abort here, not after the claw has already closed.
+    // On abort we leave the servo where it stopped and detach (cutting drive)
+    // rather than continuing to close on whatever is in the gripper.
     for (int angle = CLAW_OPEN_ANGLE; angle <= CLAW_CLOSED_ANGLE; angle += 2) {
         clawServo.write(angle);
-        delay(15); // Increase to 20 or 25 if it's STILL too fast
+        clawCurrentAngle = angle;
+        if (interruptibleDelay(15)) { clawServo.detach(); return; }
     }
 
-    delay(800); // Wait almost a full second to ensure a firm grip before moving
+    if (interruptibleDelay(800)) { clawServo.detach(); return; }  // firm grip
 
     clawServo.detach();
     clawCurrentAngle = CLAW_CLOSED_ANGLE;
@@ -702,7 +840,7 @@ void closeClawGrip() {
     itemGrabbed = true;
     disableSensors();
 
-    delay(GRAB_SETTLE_MS); // let the grip firm up before the robot moves the item
+    interruptibleDelay(GRAB_SETTLE_MS); // let the grip firm up before moving
 }
 
 // Reads the block color (majority vote) and grips ONLY if it matches `color`
@@ -796,18 +934,18 @@ void executeApproachMovement(int currentDistance, uint8_t startSpeed) {
 
 // Rotates in place until currentHeading matches targetHeading, always
 // turning the short way round the NORTH/EAST/SOUTH/WEST compass.
+// The rotate primitives now update currentHeading themselves, so this loop just
+// picks a direction and spins until the heading matches — it must NOT also step
+// the heading, or every turn would count twice.
 void turnToHeading(int targetHeading) {
     while (currentHeading != targetHeading) {
         if (checkEmergencyStop()) return;
         int diff = (targetHeading - currentHeading + 4) % 4;
         if (diff == 1) {
             if (!gridRotateRight90()) return;
-            currentHeading = (currentHeading + 1) % 4;
         } else {
             if (!gridRotateLeft90()) return;
-            currentHeading = (currentHeading + 3) % 4;
         }
-        reportPosition();
     }
 }
 
@@ -829,6 +967,8 @@ void moveCoord(int targetX, int targetY) {
     targetX = clampedX;
     targetY = clampedY;
 
+    // gridMoveForwardOneCoord() steps the tracked node itself, so these loops
+    // only drive — they must not also bump currentX/currentY.
     int deltaX = targetX - currentX;
     if (deltaX != 0) {
         turnToHeading((deltaX > 0) ? EAST : WEST);
@@ -836,8 +976,6 @@ void moveCoord(int targetX, int targetY) {
             if (checkEmergencyStop()) return;
             gridMoveForwardOneCoord(SPEED_START_FAST);
             if (emergencyStopActive) return;
-            currentX += (currentHeading == EAST) ? 1 : -1;
-            reportPosition();
         }
     }
 
@@ -848,8 +986,6 @@ void moveCoord(int targetX, int targetY) {
             if (checkEmergencyStop()) return;
             gridMoveForwardOneCoord(SPEED_START_FAST);
             if (emergencyStopActive) return;
-            currentY += (currentHeading == NORTH) ? 1 : -1;
-            reportPosition();
         }
     }
 
@@ -935,6 +1071,17 @@ void resetCoordinates() {
 const int BLOCK_ROWS[3] = {1, 3, 5};
 const uint8_t SEARCH_APPROACH_SPEED = PATH_APPROACH_SPEED;
 
+// Column the search changes ROW on, both on the way to the first block and on
+// every hop between blocks. Column 4 is the clear middle of the collecting grid
+// and is the same column the scripted paths turn on, so a searched route and a
+// scripted route trace the same lane. It must stay well clear of the block
+// column (1) — changing row any nearer would sweep the car past the blocks.
+const int SEARCH_TURN_X = 4;
+// Column the approach stops on: one node EAST of the block at column 1.
+// moveToGrab() creeps the last cell with the ultrasonic from here, so the car
+// never drives onto column 1 and clashes with the block.
+const int GRAB_APPROACH_X = 2;
+
 // Backs the car off the block until it re-acquires the grid node (all three
 // line sensors on the junction cross = all HIGH), so the coordinate-tracked
 // navigation to the next block starts from a known node. The grab approach
@@ -1018,16 +1165,17 @@ int searchAndGrab(int targetColour, int startRow) {
         Bridge.print(F("[SEARCH] Checking block at row "));
         Bridge.println(row);
 
-        // Route to the block via the X=3 corridor, then approach only as far as
-        // column 2 (one node EAST of the block at column 1). moveCoord does its
-        // X move before its Y move, so going to (3,row) first pulls the car out
-        // to column 3 before it changes rows — inter-block travel stays on the
-        // clear X=3 corridor instead of running along the block column. The car
-        // then stops at column 2 and lets moveToGrab creep the last bit with the
-        // ultrasonic, so it never drives onto column 1 and clashes with the block.
-        moveCoord(3, row);
+        // Change row at column 4, then run straight west to the approach node.
+        // moveCoord does its X move before its Y move, so targeting
+        // (SEARCH_TURN_X, row) first pulls the car out to column 4 and only then
+        // changes rows — every row change, first block and inter-block hop
+        // alike, happens on the clear column-4 lane rather than along the block
+        // column. The second moveCoord is then a pure westward run (4 -> 2) with
+        // no turn, which also lets the line-follow re-centre the car before the
+        // ultrasonic creeps it onto the block. Same lane the scripted paths fly.
+        moveCoord(SEARCH_TURN_X, row);
         if (emergencyStopActive) return -1;
-        moveCoord(2, row);
+        moveCoord(GRAB_APPROACH_X, row);
         if (emergencyStopActive) return -1;
         turnToHeading(WEST);
 
@@ -1080,10 +1228,8 @@ static void carryHomeViaRow3() {
         int steps = abs(grabbedRow - 3);
         for (int i = 0; i < steps; i++) {
             if (checkEmergencyStop()) return;
-            gridMoveForwardOneCoord(SPEED_START_FAST);
+            gridMoveForwardOneCoord(SPEED_START_FAST);   // steps currentY itself
             if (emergencyStopActive) return;
-            currentY += (dir == NORTH) ? 1 : -1;
-            reportPosition();
         }
     }
 
@@ -1093,12 +1239,12 @@ static void carryHomeViaRow3() {
     // (path 2) it is the one 180° the route allows.
     turnToHeading(EAST);
     if (emergencyStopActive) return;
+    // gridMoveForwardOneCoord() advances currentX (heading is EAST), which is
+    // what terminates this loop.
     while (currentX < 9) {
         if (checkEmergencyStop()) return;
         gridMoveForwardOneCoord(SPEED_START_FAST);
         if (emergencyStopActive) return;
-        currentX += 1;
-        reportPosition();
     }
 
     Bridge.println(F("[RETURN] Drop node (9,3) reached — releasing grip."));
@@ -1127,12 +1273,12 @@ static void returnHomeFromDrop() {
     if (emergencyStopActive) return;
 
     // Line-follow west back onto home (7,3), one node at a time.
+    // gridMoveForwardOneCoord() decrements currentX (heading is WEST), which is
+    // what terminates this loop.
     while (currentX > 7) {
         if (checkEmergencyStop()) return;
         gridMoveForwardOneCoord(SPEED_START_FAST);
         if (emergencyStopActive) return;
-        currentX -= 1;
-        reportPosition();
     }
     gridStop();
     Bridge.println(F("[RETURN] Home (7,3) reached."));
@@ -1173,36 +1319,51 @@ void searchGrabAndDrop(int targetColour, int startRow) {
 enum Action { FWD, LFT, RGT, GRB, REV, DRP, GDR, DLY };
 struct Step { Action act; uint8_t arg; };
 
+// Every FWD count below is written as a column/row delta against the tracked
+// pose, starting from home (7,3) facing WEST. Two invariants hold across all
+// three, and they are the same ones searchForColour()/executeAutoMission()
+// already obey:
+//
+//   * The car CHANGES ROW AT COLUMN 4 — never on the block column and never in
+//     the START zone. Column 4 is the clear middle of the collecting grid.
+//   * The last FWD before a GRB stops on COLUMN 2, one node east of the block
+//     at column 1. moveToGrab() creeps the remaining cell with the ultrasonic
+//     and halts at GRAB_APPROACH_DISTANCE_CM. gridMoveForwardBlocks() only
+//     counts junctions and never consults the ultrasonic, so a FWD that counted
+//     as far as column 1 would drive the chassis into the block.
+
 const Step path1[] = {
-    // Outbound via column 4: FWD 3 = col 7->4, drop to row 1 at col 4, then
-    // FWD 3 = col 4->1 gives a straight line-follow run so the car re-centers
+    // Outbound: FWD 3 = col 7->4, drop to row 1 at col 4 (the row change), then
+    // FWD 2 = col 4->2 gives a straight line-follow run so the car re-centers
     // after the RGT turn before the ultrasonic creeps onto the block at column 1.
     {FWD, 3}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3},
-    {FWD, 3}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
     // No 180: back off the block, single RGT to face row 3, cross to row 3,
-    // then RGT east and run the row-3 corridor. FWD 8 counts columns 2..9 so
+    // then RGT east and run the row-3 corridor. FWD 7 counts columns 2..9 so
     // the car stops ON the drop node (9,3) and releases the block there.
-    {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
+    {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 
 const Step path2[] = {
-    {FWD, 4}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},
-    // FWD 8 counts columns 2..9 so the car stops ON the drop node (9,3) and
+    // The block sits on row 3, the same row as home — no row change, so no turn
+    // at column 4. FWD 5 = col 7->2, stopping one node east of the block.
+    {FWD, 5}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    // FWD 7 counts columns 2..9 so the car stops ON the drop node (9,3) and
     // releases the block there.
-    {RGT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
+    {RGT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 //GDR was = 0
 const Step path3[] = {
-    // Outbound via column 4 (mirror of path1): FWD 3 = col 7->4, rise to row 5
-    // at col 4, then FWD 3 = col 4->1 straight run before the grab approach.
+    // Outbound (mirror of path1): FWD 3 = col 7->4, rise to row 5 at col 4 (the
+    // row change), then FWD 2 = col 4->2 straight run before the grab approach.
     {FWD, 3}, {DLY, 3}, {RGT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3},
-    {FWD, 3}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
+    {FWD, 2}, {DLY, 3}, {GRB, ANY}, {DLY, 3}, {REV, 0}, {DLY, 3},
     // No 180: back off the block, single LFT to face row 3, cross to row 3,
-    // then LFT east and run the row-3 corridor. FWD 8 counts columns 2..9 so
+    // then LFT east and run the row-3 corridor. FWD 7 counts columns 2..9 so
     // the car stops ON the drop node (9,3) and releases the block there.
-    {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 8}, {DLY, 2}, {DRP, 0},
+    {LFT, 0}, {DLY, 3}, {FWD, 2}, {DLY, 3}, {LFT, 0}, {DLY, 3}, {FWD, 7}, {DLY, 2}, {DRP, 0},
     {REV, 2}
 };
 
@@ -1274,15 +1435,16 @@ void handleSerialCommand() {
     // the ESP32 wireless bridge on espSerial. Read a line from whichever has
     // data this tick; replies go out through Bridge (both links) so both
     // dashboards see the [ACK]/telemetry response.
+    // Read through the same non-blocking readers the mid-move stop check uses,
+    // so the two paths can't steal partial lines from each other. A command
+    // that arrived mid-move was stashed in deferredCmd — run it first.
     String line;
-    if (Serial.available()) {
-        line = Serial.readStringUntil('\n');
-    } else if (espSerial.available()) {
-        line = espSerial.readStringUntil('\n');
-    } else {
+    if (deferredCmd.length()) {
+        line = deferredCmd;
+        deferredCmd = "";
+    } else if (!usbReader.poll(Serial, line) && !espReader.poll(espSerial, line)) {
         return;
     }
-    line.trim();
     if (line.length() == 0) return;
 
     // Split into VERB and optional numeric ARG at the ':'

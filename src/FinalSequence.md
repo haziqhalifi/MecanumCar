@@ -136,9 +136,39 @@ Each mission is a `Step { Action act; uint8_t arg; }` array, run by `runPath()`:
 - Keeps `sensorsEnabled` **off** during navigation and turns it on only for the last `FWD` before a `GRB` (via `nextRealStepIsGrab`) and the `GRB` itself, so the ultrasonic only fires during the actual approach.
 - Inserts a `STEP_TRANSITION_MS` settle pause between every step.
 
-Three scripted routes:
-- **`path1`** / **`path3`** — mirror-image weaves: 2 blocks → turn → 2 blocks → turn → 2 blocks → grab → turn → reverse → turn → 2 blocks → turn → 2 blocks → turn → 5 blocks → drop → reverse 2.
-- **`path2`** — simpler: 4 blocks → grab → turn → reverse → turn → 7 blocks → drop → reverse 2.
+Three scripted routes, all starting from home `(7,3)` facing WEST and ending on
+the drop node `(9,3)`.
+
+### Route invariants
+
+These two hold for **every** outbound route — the three scripted paths, the
+colour hunt in `searchAndGrab()`, and `executeAutoMission()` alike. A searched
+route and a scripted route to the same block trace the same lane.
+
+- **Row changes happen at column 4** — the clear middle of the collecting grid,
+  never on the block column and never inside the START zone. The scripted paths
+  spend their first `FWD 3` reaching it; the search targets `SEARCH_TURN_X`
+  before its row move (`moveCoord` does X before Y, so aiming at
+  `(SEARCH_TURN_X, row)` pulls the car out to column 4 *then* changes row).
+- **The approach stops on column 2** (`GRAB_APPROACH_X`), one node east of the
+  block at column 1. `moveToGrab()` creeps the remaining cell with the ultrasonic
+  and stops at `GRAB_APPROACH_DISTANCE_CM`. This one is load-bearing:
+  `gridMoveForwardBlocks()` only counts junctions and never reads the ultrasonic,
+  so a `FWD` counting through to column 1 drives the chassis into the block. The
+  final 4→2 leg is also a straight, turn-free run, which lets the line-follow
+  re-centre the car before it creeps in — a skewed car can't grip.
+
+| | route |
+|---|---|
+| **`path1`** | `FWD 3` (col 7→4) → `LFT` → `FWD 2` (row 3→1) → `RGT` → `FWD 2` (col 4→2) → grab → reverse → `RGT` → `FWD 2` (row 1→3) → `RGT` → `FWD 7` (col 2→9) → drop → reverse 2 |
+| **`path2`** | `FWD 5` (col 7→2) → grab → `RGT` → reverse → `RGT` → `FWD 7` (col 2→9) → drop → reverse 2 |
+| **`path3`** | `FWD 3` (col 7→4) → `RGT` → `FWD 2` (row 3→5) → `LFT` → `FWD 2` (col 4→2) → grab → reverse → `LFT` → `FWD 2` (row 5→3) → `LFT` → `FWD 7` (col 2→9) → drop → reverse 2 |
+
+`path1`/`path3` are mirror images. Their return legs change row at column 2 (not
+4) on purpose: a block on row 1 or 5 reaches the row-3 corridor with one 90° turn
+onto it and another to face east, so the loaded car never has to spin 180°.
+`path2`'s block is already on row 3, so it needs no row change outbound — and its
+`RGT` … `RGT` return is the one 180° the route allows.
 
 ## IR command map
 
@@ -305,5 +335,5 @@ track and hardware — changing them requires re-testing on the real car.
 ## Known gaps / caveats
 
 - **Motor stall floor**: because speed maps straight to raw PWM, values below the mid-30s don't move the car. Several approach/crawl constants sit just above that floor; lower them and the car buzzes in place instead of creeping.
-- **Servo brown-out**: gripping a firm object draws stall current; if the servo shares the Arduino 5V rail it can fail to move on the next command (looks like "claw won't open/close"). `openClawWithAttach()` re-sends the open angle several times to mitigate, but a separate 5–6V servo supply with common ground is the real fix. A standalone `test/ServoIsolationTest.cpp` (build env `servo_test`) exercises the servo alone.
+- **Servo brown-out**: gripping a firm object draws stall current; if the servo shares the Arduino 5V rail it can fail to move on the next command (looks like "claw won't open/close"). `openClawWithAttach()` re-sends the open angle several times to mitigate, but a separate 5–6V servo supply with common ground is the real fix.
 - **Line-lost handling**: when all three line sensors go LOW the follower drives straight with no memory of the last drift direction, so a hard drift off the line is not actively recovered.
