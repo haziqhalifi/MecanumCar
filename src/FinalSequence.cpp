@@ -2094,6 +2094,7 @@ void loop() {
                 // case 28: executeAutoMission(3, YELLOW); break;              // button 5
                 // case 90: executeAutoMission(5, YELLOW); break;              // button 6
                 case 74: openClawWithAttach(); break; // button #
+                case 82: openClawWithAttach(); break; // button 0
                 case 70: // button UP — creep forward at 40, slowing further on approach, grip on contact
                     sensorsEnabled = true;
                     moveToGrab(ANY, 40);
